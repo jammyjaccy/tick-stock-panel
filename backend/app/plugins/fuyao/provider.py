@@ -62,7 +62,10 @@ SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级�
 # 扶摇 *ms 时间字段为北京时间零点(= UTC 前一日 16:00), +8h 后按 UTC 解析即得交易日
 _SH_MS = 28_800_000
 _HIST_MAX_SPAN_MS = 3650 * 86_400_000  # historical 单次窗口上限 10 年, 超出由本层分片
-_HIST_INTERVAL_S = 0.12  # 单标的请求节流(实测 200+ 连发未触发 4001 限频)
+# 单标的请求节流。原值 0.12 在首次全市场同步时实测冲到 111 请求/分钟,
+# 撞上服务端分钟配额 (HTTP 429, 非信封 code 4001)。0.3 把理论峰值压到
+# ~200/分钟以内, 再配合 client 层 429 退避重试兜底。
+_HIST_INTERVAL_S = 0.3
 _FINANCIAL_HISTORY_PERIODS = 8  # 财务首装全量历史: 最近 8 期季报(约 2 年)
 _VALUATION_BATCH = 100  # 估值/价格快照端点单次上限 100 只
 # 项目财务表名 → 扶摇报表端点名

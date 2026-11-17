@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://fuyao.aicubes.cn"
 HISTORICAL_BATCH_LIMIT = 10
 
+# 429/5xx 退避重试: 服务端按分钟配额限流, 首发全市场补查很容易撞上单标的接口的 429。
+# 不重试会让 429 直接升级为 ProviderRequestError, 同步层丢弃整轮暂存帧 (实测首次
+# 全市场同步在 41% 处因一次 429 归零, 且每次重跑都在同一位置再撞, 永远跑不完)。
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_RETRY_WAIT_S = (10.0, 20.0, 30.0)  # 第 1/2/3 次重试前的默认等待 (秒)
+_RETRY_WAIT_MAX_S = 60.0            # Retry-After 的上限, 防止服务端给出超长等待
+_DEFAULT_RETRIES = 3
+
 # 单页 6000 覆盖全市场(实测 ~5600 含北交所, 2026-08 服务端不截断 limit=6000),
 # 一次请求拉完; 分页循环兜底未来标的扩容或服务端改为截断的场景。
 _SNAPSHOT_PAGE_SIZE = 6000
@@ -61,13 +69,39 @@ class FuyaoClient:
         self._http.close()
 
     # ---- 内部 ----
-    def _get(self, path: str, params: dict) -> dict:
-        """GET + 信封解包。code != 0 时抛 FuyaoError(含 code 与 message)。"""
-        try:
-            resp = self._http.get(path, params=params)
-        except httpx.HTTPError as e:
-            raise FuyaoError(f"网络请求失败: {e}") from e
-        if resp.status_code != 200:
+    @staticmethod
+    def _retry_wait(resp: httpx.Response, attempt: int) -> float:
+        """重试等待时长: 优先服务端 Retry-After, 否则按次数递增, 上限 60 秒。"""
+        headers = getattr(resp, "headers", None)
+        header = ((headers.get("retry-after") if headers is not None else "") or "").strip()
+        if header.isdigit():
+            return min(float(header), _RETRY_WAIT_MAX_S)
+        idx = min(attempt, len(_RETRY_WAIT_S) - 1)
+        return min(_RETRY_WAIT_S[idx], _RETRY_WAIT_MAX_S)
+
+    def _get(self, path: str, params: dict, retries: int = _DEFAULT_RETRIES) -> dict:
+        """GET + 信封解包。code != 0 时抛 FuyaoError(含 code 与 message)。
+
+        retries: 429/5xx 的额外重试次数。实时轮询路径传 0 —— 宁可本轮空数据,
+        也不要把轮询线程卡在退避里。
+        """
+        attempt = 0
+        while True:
+            try:
+                resp = self._http.get(path, params=params)
+            except httpx.HTTPError as e:
+                raise FuyaoError(f"网络请求失败: {e}") from e
+            if resp.status_code == 200:
+                break
+            if resp.status_code in _RETRY_STATUS and attempt < retries:
+                wait = self._retry_wait(resp, attempt)
+                logger.warning(
+                    "扶摇 %s 返回 %d, %.0f 秒后重试 (%d/%d)",
+                    path, resp.status_code, wait, attempt + 1, retries,
+                )
+                time.sleep(wait)
+                attempt += 1
+                continue
             raise FuyaoError(f"HTTP {resp.status_code}: {path}")
         try:
             payload = resp.json()
@@ -89,7 +123,7 @@ class FuyaoClient:
         实测响应(2026-08): data={timestamp, total, item}; 官方文档示例为
         data={count, data}。两者都兼容, 以实测为准。
         """
-        data = self._get("/api/a-share/prices/snapshot", {"limit": limit, "offset": offset})
+        data = self._get("/api/a-share/prices/snapshot", {"limit": limit, "offset": offset}, retries=0)
         try:
             self.last_server_ts = int(data.get("timestamp") or 0)
         except (TypeError, ValueError):
@@ -143,7 +177,7 @@ class FuyaoClient:
         if not thscodes:
             return [], 0
         joined = ",".join(thscodes[:627])
-        data = self._get("/api/a-share-index/prices/snapshot", {"thscodes": joined})
+        data = self._get("/api/a-share-index/prices/snapshot", {"thscodes": joined}, retries=0)
         try:
             server_ts = int(data.get("timestamp") or 0)
         except (TypeError, ValueError):
