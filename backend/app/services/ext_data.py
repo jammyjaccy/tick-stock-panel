@@ -712,6 +712,9 @@ def normalize_symbol(series: pl.Series, lookup: dict[str, str] | None = None) ->
         # 已经是标准格式（含 .），直接返回
         if "." in val:
             return val
+        # 交易所前缀形式 (新浪/腾讯 sh600000、sz000001、bj920418) → 600000.SH
+        if len(val) == 8 and val[:2].lower() in ("sh", "sz", "bj") and val[2:].isdigit():
+            return f"{val[2:]}.{val[:2].upper()}"
         # 纯6位数字代码 → 优先查维表
         if len(val) == 6 and val.isdigit():
             mapped = _lookup.get(val)
