@@ -8,6 +8,7 @@ enriched 的 turnover_rate 随之全空, 依赖换手率与流通市值的策略
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -79,6 +80,54 @@ def test_new_symbol_keeps_null_shares_instead_of_faking(tmp_path, monkeypatch) -
     assert new.height == 1
     assert new["float_shares"][0] is None
     assert new["total_shares"][0] is None
+
+
+def _write_existing_with_bj(data_dir: Path) -> None:
+    _write_existing(data_dir)
+    path = data_dir / "instruments" / "instruments.parquet"
+    df = pl.read_parquet(path)
+    bj = pl.DataFrame({
+        "symbol": ["920001.BJ"], "name": ["北交样本"], "code": ["920001"],
+        "exchange": ["BJ"], "region": ["CN"], "type": ["stock"],
+        "listing_date": ["2023-01-05"], "total_shares": [5.0e7],
+        "float_shares": [2.0e7], "tick_size": [0.01],
+        "limit_up": [13.0], "limit_down": [7.0],
+    })
+    pl.concat([df, bj], how="vertical").write_parquet(path)
+
+
+def test_exchange_failure_keeps_market_from_existing_table(tmp_path, monkeypatch) -> None:
+    """单市场 get_instruments 失败 (如 503) 时沿用历史维表, 不把整个市场抹掉。
+
+    回归背景: 2026-11-18 BJ 接口两次 503, 旧实现整表覆盖后北交所 356 只
+    从维表消失, 标的池 5,893 -> 5,537。
+    """
+    _write_existing_with_bj(tmp_path)
+
+    def _get_instruments(ex, instrument_type="stock"):
+        if ex == "BJ":
+            raise RuntimeError("503 Service Unavailable")
+        code, name = {"SH": ("600000", "浦发银行"), "SZ": ("000001", "平安银行")}[ex]
+        return [
+            {"symbol": f"{code}.{ex}", "exchange": ex, "code": code,
+             "name": name, "region": "CN", "type": "stock", "ext": {}},
+        ]
+
+    tf = SimpleNamespace(exchanges=SimpleNamespace(get_instruments=_get_instruments))
+    monkeypatch.setattr(isync, "_fetch_instruments_via_provider", lambda: None)
+    monkeypatch.setattr(isync, "get_client", lambda: tf)
+    monkeypatch.setattr(isync.tf_client, "current_mode", lambda: "free")
+
+    assert isync.sync_instruments(tmp_path) == 3
+
+    df = pl.read_parquet(tmp_path / "instruments" / "instruments.parquet")
+    bj = df.filter(pl.col("symbol") == "920001.BJ")
+    assert bj.height == 1
+    assert bj["name"][0] == "北交样本"
+    assert bj["float_shares"][0] == pytest.approx(2.0e7)
+    # 涨跌停价随交易日变化, 不沿用旧值
+    assert bj["limit_up"][0] is None
+    assert bj["limit_down"][0] is None
 
 
 def test_provider_fields_win_when_present(tmp_path, monkeypatch) -> None:

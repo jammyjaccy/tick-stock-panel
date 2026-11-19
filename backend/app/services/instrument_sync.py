@@ -73,6 +73,26 @@ def _fetch_instruments_via_provider() -> list[dict] | None:
     return rows
 
 
+def _existing_rows_for_exchanges(data_dir: Path, exchanges: list[str]) -> list[dict]:
+    """从既有维表取回失败市场的标的, 防止单市场 503 把整个市场从维表里抹掉。
+
+    只取静态字段: 涨跌停价随交易日变化, 不沿用旧值 (与 _SHARE_FIELDS 同一口径)。
+    """
+    path = data_dir / "instruments" / "instruments.parquet"
+    if not path.exists():
+        return []
+    try:
+        df = pl.read_parquet(path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("instruments 历史维表读取失败, 无法沿用失败市场: %s", e)
+        return []
+    if "exchange" not in df.columns:
+        return []
+    keep = [c for c in ("symbol", "name", "code", "exchange", "region", "type", *_SHARE_FIELDS)
+            if c in df.columns]
+    return df.filter(pl.col("exchange").is_in(exchanges)).select(keep).to_dicts()
+
+
 def sync_instruments(data_dir: Path) -> int:
     """全量同步标的维表 → data/instruments/instruments.parquet。
 
@@ -85,14 +105,33 @@ def sync_instruments(data_dir: Path) -> int:
         # 免费接口的限价来自历史行情，不能盖上同步日期当作当日权威价。
         current_limits = tf_client.current_mode() == "api_key"
         all_rows = []
+        failed: list[str] = []
         for ex in _EXCHANGES:
             try:
                 items = tf.exchanges.get_instruments(ex, instrument_type="stock")
                 if items:
                     all_rows.extend(_flatten_instruments(items, current_limits=current_limits))
                     logger.info("instruments %s: %d stocks", ex, len(items))
+                else:
+                    failed.append(ex)
             except Exception as e:
+                failed.append(ex)
                 logger.warning("get_instruments(%s) failed: %s", ex, e)
+        if failed:
+            # 实测 2026-11-18: BJ/SZ 偶发 503, 旧实现照样整表覆盖, 标的池
+            # 5,893 -> 5,537 (北交所 356 只消失), 实时/财务/选股 universe 全漏。
+            restored = _existing_rows_for_exchanges(data_dir, failed)
+            if restored:
+                all_rows.extend(restored)
+                logger.warning(
+                    "instruments %s 拉取失败, 沿用历史维表 %d 只 (静态字段; 涨跌停价置空)",
+                    "/".join(failed), len(restored),
+                )
+            else:
+                logger.warning(
+                    "instruments %s 拉取失败且无历史维表可沿用, 本次维表将缺少这些市场",
+                    "/".join(failed),
+                )
 
     if not all_rows:
         return 0
