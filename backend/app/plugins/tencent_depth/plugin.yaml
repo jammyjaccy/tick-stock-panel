@@ -1,0 +1,13 @@
+# 腾讯五档盘口 — 免费公开行情源, 无 Key, 无额外依赖。
+# 只声明 depth5: 其余能力不声明, 由 provider_has_dataset 判定后回退 TickFlow。
+name: tencent_depth
+display_name: "腾讯五档"
+runtime: none
+entry: app.plugins.tencent_depth.provider:TencentDepthProvider
+datasets: [depth5]
+description: "腾讯公开行情接口的买卖五档 (沪/深/北), 免费无 Key。用于连板梯队真假板封单判定。"
+homepage: "https://gu.qq.com"
+usage_notes:
+  - "单次请求最多约 900 只 (URL 长度限制), 服务层按 100 只/批切片"
+  - "五档量单位为手; 收盘后返回收盘快照, 盘中每分钟刷新"
+  - "不提供历史五档, 只做当日定版与盘中修正"
