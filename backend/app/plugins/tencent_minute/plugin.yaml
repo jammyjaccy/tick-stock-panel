@@ -1,0 +1,14 @@
+# 腾讯 1 分钟 K — 免费公开行情源, 无 Key, 无额外依赖。
+# 只声明 minute: 其余能力不声明, 由 provider_has_dataset 判定后回退 TickFlow。
+name: tencent_minute
+display_name: "腾讯分钟"
+runtime: none
+entry: app.plugins.tencent_minute.provider:TencentMinuteProvider
+datasets: [minute]
+description: "腾讯 1 分钟 K 线 (个股/指数), 免费无 Key; 仅最近约 320 根 (1.3 个交易日), 无成交额, 不含北交所。"
+homepage: "https://gu.qq.com"
+usage_notes:
+  - "单标的单请求, 服务层按需逐只拉取"
+  - "量单位为手 (个股与指数一致); 不提供分钟成交额, amount 返回 null"
+  - "只保留最近约 320 根, 历史更早的分钟数据取不到"
+  - "北交所 (bj 前缀) 返回空"
