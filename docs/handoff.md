@@ -1,23 +1,28 @@
 # 交接说明 (HANDOFF)
 
 给在 `/home/workspace/tickflow-stock-panel` 新开会话的 agent 或人.
-先读本文件, 再读 `docs/decisions.md`.
+先读本文件, 再做任何改动. 详细数据口径与验收记录在:
+- `docs/data-inventory.md` — 数据资产总清单 (单一事实来源)
+- `docs/data-tickets.md` — 工单 T-01 ~ T-15 与验收证据
 
-更新时间: 2026-11-17 晚 (部署完成当天)
+更新时间: 2026-11-19 22:20
+
+---
 
 ## 一. 一句话现状
 
-面板已部署并跑通, 局域网访问 `http://192.168.1.9:3018`.
-日K / 除权因子 / 指标 / 指数 / 市场环境 / 主线 / 财务 全部可用且不花积分.
-分钟K 批量同步因通达信积分耗尽被关闭, 只保留已落盘的 4 天数据.
+面板已部署, 局域网 `http://192.168.1.9:3018`.
+**日K / 除权因子 / 指标 / 指数日K / 市场环境 / 主线 覆盖 2016-11 至今**;
+**财务核心指标 8 期**; **分钟 K 从 2026-11-19 起每日自动落盘**;
+五档封单与分钟都走腾讯免费源.
+剩下的是: 板块资金流 (东财限流, 需换方案), 复盘页日期选择 (卡前端构建), 财务公告日 (候补).
 
 ## 二. 部署形态 (改动容器前必读)
 
 - 容器名: `tsp`
-- 镜像: `ghcr.io/shy3130/tick-stock-panel:latest`
-  digest `sha256:d1230fb1ea0e4d533d2e3b09fdbdc1563acf41950cb75bff1508aeadb4b50f83`
-- 数据目录: `/home/workspace/tickflow-data` (容器内 `/app/data`, 落盘文件属主 root)
-- 启动时间: 2026-11-17 17:11
+- 镜像: `ghcr.io/shy3130/tick-stock-panel@sha256:d1230fb1ea0e4d533d2e3b09fdbdc1563acf41950cb75bff1508aeadb4b50f83`
+- 数据目录: `/home/workspace/tickflow-data` (容器内 `/app/data`, 属主 root)
+- 镜像内是 v0.3.37; 当前用挂载补丁叠加本仓库改动, 尚未自建镜像
 
 ### 完整启动命令 (重建容器必须一字不差)
 
@@ -25,175 +30,255 @@
 docker run -d --name tsp \
   -p 0.0.0.0:3018:3018 \
   -e DATA_DIR=/app/data \
+  --dns 223.5.5.5 --dns 119.29.29.29 \
   -v /home/workspace/tickflow-data:/app/data \
   -v /home/workspace/tickflow-stock-panel/backend/app/plugins/fuyao/client.py:/app/app/plugins/fuyao/client.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/plugins/fuyao/provider.py:/app/app/plugins/fuyao/provider.py:ro \
+  -v /home/workspace/tickflow-stock-panel/backend/app/services/instrument_sync.py:/app/app/services/instrument_sync.py:ro \
+  -v /home/workspace/tickflow-stock-panel/backend/app/plugins/tencent_depth:/app/app/plugins/tencent_depth:ro \
+  -v /home/workspace/tickflow-stock-panel/backend/app/plugins/tencent_minute:/app/app/plugins/tencent_minute:ro \
+  -v /home/workspace/tickflow-stock-panel/backend/app/api/settings.py:/app/app/api/settings.py:ro \
+  -v /home/workspace/tickflow-stock-panel/backend/app/api/indices.py:/app/app/api/indices.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/tests:/app/tests:ro \
   --restart unless-stopped \
-  ghcr.io/shy3130/tick-stock-panel:latest
+  ghcr.io/shy3130/tick-stock-panel@sha256:d1230fb1ea0e4d533d2e3b09fdbdc1563acf41950cb75bff1508aeadb4b50f83
 ```
 
-**三个 `-v` 是补丁挂载, 少一个补丁就失效** (回到会撞 429 的旧代码, 见第五节).
-`backend/tests` 挂载只是为了能在容器里跑测试, 不影响运行; 可以省, 但省了就没法 `uv run --with pytest`.
+**八个挂载, 少一个就失效**:
 
-长期方案: 从自己的 fork 构建镜像, 把补丁烤进镜像, 摆脱挂载. 未做.
+| 挂载 | 作用 |
+|---|---|
+| fuyao/client.py | 429/5xx 退避重试, 实时快照不重试 |
+| fuyao/provider.py | 单标的节流 0.3 秒; 指数历史逐只拉 (0.6 秒), 股->手 |
+| instrument_sync.py | 单市场 503 时沿用历史维表, 不再抹掉北交所 |
+| tencent_depth/ | 腾讯五档插件 (depth5) |
+| tencent_minute/ | 腾讯分钟插件 (minute, 个股/指数/成交额) |
+| api/settings.py | 手动修正等门禁按"生效源"判断能力 |
+| api/indices.py | 指数日K同步门禁改为 capability_gate("daily") |
+| backend/tests | 容器内跑 pytest 用, 可省 |
 
-## 三. 本次改的代码 (未提交)
+**两个必须记住的坑**:
+1. `--dns` 必须带. 2026-11-19 14:37 容器 DNS 跟着宿主网络漂移失效, 全站外网请求挂掉,
+   15:02 五档定版与 15:35 管道静默失败.
+2. 单文件挂载跟 inode: 宿主上"写临时文件再 rename"的编辑器改完, 容器里还是旧内容,
+   必须 `docker rm -f` + `docker run` 重建; 目录挂载不受影响.
+
+## 三. 代码改动 (未提交, 工作区)
 
 | 文件 | 改动 |
 |---|---|
-| `backend/app/plugins/fuyao/client.py` | `_get()` 增加 429/5xx 退避重试 (默认 3 次, 等 10/20/30 秒, 尊重 `Retry-After`, 上限 60 秒); 实时快照两处调用传 `retries=0` 不重试 |
-| `backend/app/plugins/fuyao/provider.py` | `_HIST_INTERVAL_S` 0.12 -> 0.3 (单标的节流) |
-| `backend/tests/test_fuyao_client_retry.py` | 新增 5 条测试 (429 重试成功 / 耗尽仍抛错 / Retry-After 优先 / 实时不重试 / 5xx 也重试) |
+| `backend/app/plugins/fuyao/client.py` | 429/5xx 退避重试 (3 次, 10/20/30 秒) |
+| `backend/app/plugins/fuyao/provider.py` | 单标的节流 0.3 秒; 指数历史分支 (逐只, 0.6 秒, 股->手); `_kline_rows` 统一 股->手 |
+| `backend/app/services/instrument_sync.py` | 单市场拉取失败时沿用历史维表 |
+| `backend/app/plugins/tencent_depth/` | 新增: 腾讯五档 depth5 插件 |
+| `backend/app/plugins/tencent_minute/` | 新增: 腾讯分钟插件 (OHLCV + 当日累计额差分成交额) |
+| `backend/app/api/settings.py` | 手动修正接口门禁改为生效源 |
+| `backend/app/api/indices.py` | 指数日K同步门禁改为 `capability_gate("daily")` |
+| `backend/tests/test_fuyao_provider.py` | +3 指数历史 |
+| `backend/tests/test_fuyao_historical_batch.py` | 拆出 ETF 不变 + 指数走单标的 |
+| `backend/tests/test_tencent_depth_provider.py` | 新增 4 条 |
+| `backend/tests/test_tencent_minute_provider.py` | 新增 9 条 |
 
-验证 (实测):
+测试 (容器内):
+
+```bash
+docker exec tsp sh -lc "cd /app && uv run --with pytest tests/ -q"
+```
+
+已跑过并通过: `test_fuyao_provider.py` 87, `test_fuyao_historical_batch.py` 47,
+`test_tencent_minute_provider.py` 9, 五档/指数/minute 相关套件 54.
+
+## 四. 当前数据 (2026-11-19 22:20 实测)
 
 ```
-5 passed   (test_fuyao_client_retry.py)
-141 passed (test_fuyao_provider.py + test_fuyao_historical_batch.py + test_fuyao_financial.py)
+标的维表     5,893 只 (沪 2,469 / 深 3,068 / 北 356)
+日K          2,431 天 / 10,412,921 行, 2016-11-16 ~ 2026-11-19
+指标 enriched 2,431 天 / 10,412,921 行, 15 列
+除权因子     35,462 行, 2016-11-18 ~ 2026-11-19
+指数日K      599 只 / 2,647 天 / 1,409,690 行, 2016-01-04 起 (569 只有历史)
+指数指标     2,647 天 / 1,409,690 行, 12 列
+市场环境     2,431 天 (2016-11-16 起)
+市场主线     64,062 行, 到 2026-11-19
+财务三表     5,580 只 x 8 期; 核心指标 43,456 行 / 8 期 (2024-12-31 ~ 2026-09-30); 股本 0
+分钟K        5 天 (11-12/13/16/17/19); 11-19 = 1,256,706 行 / 5,217 只 / 中位 241 根 / 成交额 100%
+五档封单     2 天 (11-18: 91 行, 11-19: 111 行)
+龙虎榜       最近 60 个交易日 (2026-08-19 ~ 11-18 回补 + 按需)
+扩展表       概念 5,584 行 / 行业 5,580 行 (每日快照, 无历史)
 ```
 
-在容器内执行: `docker exec tsp sh -lc "cd /app && uv run --with pytest pytest tests/ -q"`
-(镜像里无 pytest, 靠 `--with pytest` 临时装; 需要容器内有网络)
-
-## 四. 当前数据 (2026-11-17 19:53 实测)
-
-```
-标的池     5,893 只       交易日 243 天 (2025-11-17 ~ 2026-11-17)
-日K        25,169 分区    197 MB
-指标       243 天, 15 列  65 MB   (close 前复权 / raw_close 原始价 / 换手率 / 连板天数)
-除权因子   3,778 只有事件  4,951 行
-指数       599 只 × 243 天 145,270 行
-市场环境   243 天           (冰点/启动/主升/高潮/退潮/修复)
-市场主线   7,806 行
-分钟K      4 天 × ~5,150 只 (2026-11-12/13/16/17), 51 MB, 缺 11-11
-总占用     233.87 MB
-掉队标的   7 只 (今日无数据, 软告警)
-```
+注意: `kline_daily` 里有 242 个日期用的是 `part-stream-*.parquet` 分片 (不是 `part.parquet`),
+写统计脚本要 glob `date=*/*.parquet`, 只找 `part.parquet` 会误判成缺数据.
 
 ### 能力路由 (设置页可改)
 
 ```
-日K        fuyao
-除权因子   fuyao
-实时行情   fuyao      <- 故意不切 TdxQuant, 6 秒轮询切过去就是每 6 秒烧分
-财务       fuyao
-分钟K      tdxquant
-五档盘口   tdxquant
-全量分钟   tdxquant
-TickFlow 档位: none (未付费, 无 Key)
+日K        fuyao          可用
+除权因子   fuyao          可用
+实时行情   fuyao          可用 (6 秒轮询)
+财务       fuyao          可用 (指标单股单期)
+五档盘口   tencent_depth  可用 (免费)
+分钟K      tencent_minute 可用 (最近约 320 根 + 当日成交额)
+全量分钟   tickflow       不可用
+TickFlow 档位: none (未付费)
 ```
 
 ### 关键 preferences
 
 ```
-pipeline_regime_enabled  = true    (市场环境/主线随管道计算)
-minute_sync_enabled      = false   (关闭, 见第五节积分问题)
-minute_sync_days         = 5
+pipeline_regime_enabled   = true
+minute_sync_enabled       = true
+minute_sync_days          = 1
+minute_data_provider      = tencent_minute
+depth5_data_provider      = tencent_depth
+limit_ladder_monitor_enabled = false   (11-19 盘中临时开过, 收盘已关)
+depth_polling_interval    = 10.0
 ```
 
-## 五. 踩过的坑 (别再踩一遍)
+## 五. 工单状态
 
-### 1. fuyao HTTP 429 导致整轮同步归零
+| 票 | 内容 | 状态 |
+|---|---|---|
+| T-01 | 日K 历史导入 | 已验证 (2,431 天) |
+| T-02 | 除权因子历史 | 已验证 (35,462 行) |
+| T-03 | 指标/环境/主线重算 | 已验证 |
+| T-04 | 五档封单 (腾讯) | 盘中 4 项已验; **11-20 复验一次** |
+| T-05 | 板块资金流 | **未做, 原方案不可行** (东财 100 次请求只成功 14) |
+| T-06 | 龙虎榜回补 | 数据完成; 页面入口待 T-12 |
+| T-07 | 指数分时 | 已验证 (页面确认) |
+| T-08 | 指数K线历史 | 已验证 (2,647 天, 30 只扶摇不支持) |
+| T-09 | 财务指标历史 | 已验证 (8 期 / 43,456 行) |
+| T-10 | 概念/行业历史归属 | 未做, 可能关票 |
+| T-11 | 分钟历史 | 已被 T-15 替代 |
+| T-12 | 复盘页龙虎榜日期选择 | 卡在 pnpm/前端构建 |
+| T-13 | 财务 announce_date 假公告日 | 候补 |
+| T-14 | 腾讯分钟源 | 已验证 (页面确认) |
+| T-15 | 分钟历史落盘 | 已验证 (125.7 万行/241 根/额 100%) |
 
-现象: 首次全市场日K同步在 41% 处报 `扶摇日K补查失败 xxx: HTTP 429`,
-`daily_files = 0`, 重跑仍在同一位置失败, 永远跑不完.
+## 六. 用户目标与对应功能
 
-根因链:
-- `provider.py` 批量接口没覆盖到的标的逐个回落**单标的接口**, 节流仅 0.12 秒
-- 实测峰值 111 请求/分钟, 撞 fuyao 分钟配额
-- `client.py` 对非 200 直接抛错, **无重试**
-- 同步层收到错误后**丢弃整轮暂存帧** (设计如此, 见 `docs/plugin-development.md:400`)
+1. **盘中找机会** -> 异动监控 / 监控中心 / 市场环境 / 连板梯队 + 五档封单 (已可用).
+2. **做T** -> 批次页 (`frontend/src/custom/lots/Page.tsx`, 逻辑 `backend/app/strategy/lots.py`),
+   分时图现在有真实数据 (腾讯).
+3. **选股/回测** -> 策略 / 因子 / 回测; 10 年日K + 8 期财务 + 每日分钟累积.
 
-修法: 见第三节. 实测降速到 0.3 秒后整轮 23 分钟跑完, 一次 429 都没撞.
+## 七. 踩过的坑 (别再踩一遍)
 
-### 2. TdxQuant 积分: 分钟批量非常贵
+### 1. fuyao 429 导致整轮同步归零
+回落接口节流原是 0.12 秒, 实测 111 请求/分钟撞配额; client 当时无重试.
+现为 0.3 秒 + 退避重试 (10/20/30 秒, 尊重 Retry-After).
 
-实测账单 (通达信商城「使用流水」):
+### 2. TdxQuant 没有积分
+分钟批量约 0.4 分/只/天, 账户已耗尽. **不要再尝试用 TdxQuant 批量拉分钟/五档**.
 
-```
-今日起始余额  9,999
-今日结束余额  1,641
-今日总消耗    8,358
-其中分钟批量  8,355  (19:00/19:05/19:10/19:15/19:20 五笔, 每笔约 1,670)
-其他零星      3      (Key 探测, 每次 1 分)
-```
+### 3. 读日K 会触发自动补数 (会写盘)
+`GET /api/kline/daily` 在请求区间本地完全无数据时, 会走 `daily_bootstrap.ensure_history`
+从扶摇拉取并**落盘**. 随便点一下历史日期也会产生写入.
 
-- 单价约 **0.4 分/只/天**, 全市场 5 天一轮约 **8,350 分**
-- 失败原因: 19:20 扣完剩 1,642, 下批要 1,670 -> 服务端 `TokenKey Insufficient Or Key Error`
-  (错误文案二义: "额度不足"或"Key 错误". 凭流水可判定是**额度不足**, Key 权限正常)
-- 单只按需拉 (分时图) 约 1-2 分/只, **便宜可用**; 批量才贵
-- 一次性拉分钟数据会**按段落盘**, 不像日K整轮丢弃 (4 天数据在失败后仍在)
+### 4. 数据页的统计会滞后 30~60 秒
+`/api/data/status` 有内存缓存 + 后台刷新; 看 `stats_pending` 或直接查磁盘.
 
-结论: 分钟批量保持关闭. 除非充值, 否则不要开 `minute_sync_enabled`.
+### 5. 东财接口约 9~35 次请求后断开, 短期不恢复
+2026-11-19 实测: 100 次 paced 请求 (0.35 秒间隔) 只成功 **14** 次, 第 9 次起
+`RemoteDisconnected`. **不要再用东财做全市场批量**.
 
-### 3. `/api/data/status` 的 `minute_files` 恒为 0
+### 6. 前端目前无法构建
+本机有 Node 26, 但**没有 pnpm / corepack / npm**, `frontend/node_modules` 不存在.
+任何前端改动 (T-12 日期选择) 需要先装包管理器并构建 (安装位置需 Jimmy 决定, H1).
 
-不要拿它判断分钟数据有没有落地. 实测该字段一直是 0, 而磁盘
-`/app/data/kline_minute/` 有 51 MB 真实数据. 判断一律看磁盘:
+### 7. 本机 curl 必须加 `--noproxy '*'`
+否则被 http_proxy 截走, 返回 HTTP 000 (会误判成服务没起来).
+
+### 8. 指数成交量单位 (股 vs 手)
+扶摇 `historical` 的指数 volume 是**股**, 面板内部统一**手**; 但快照接口的指数 volume
+已经是手. T-08 已把历史统一 `floor(股/100)`, 并修掉存量 2026-11-17/18 的 8 只核心指数.
+判断口径: `volume / amount` 约 0.0007 手/元 (约 13 元/股) 才对.
+
+### 9. 指数日K同步会跑 599 次请求
+`iter_daily(asset_type="index")` 逐只拉, 0.6 秒/只; 每日管道指数阶段约 10 分钟. 属预期成本.
+
+### 10. 腾讯分钟: 320 根 + 成交额要另一个接口
+`mkline` 只回最近约 1.3 个交易日, 无成交额; 成交额来自 `minute/query` 的当日累计额差分.
+**必须用 `ifzq.gtimg.cn`, 不要用 `web.ifzq` 子域名 (会返回 501)**. 北交所无分钟.
+
+### 11. 财务表 announce_date 是假公告日
+扶摇三表的 `report_date_ms` = "该季度例行披露的月日 + 当前年份":
+600519 的 2025-09-30 期显示 2026-10-31. 影响财务页展示与按时点回测. 候补 T-13, 未修.
+
+### 12. 容器 DNS 跟着宿主网络漂移
+见第二节. 症状: `Temporary failure in name resolution`, 实时/五档/分钟全挂, 管道静默失败.
+修法: 重建容器带 `--dns 223.5.5.5 --dns 119.29.29.29`; 重建后启动自检会补当日日K/指标/指数/环境/主线,
+五档定版手动补一次.
+
+### 13. 单文件挂载跟 inode
+编辑器写临时文件再 rename 后, 容器内仍是旧内容. 改完必须重建容器.
+
+### 14. `repair_date` 模式只补缺失记录
+`sync_and_persist_minute(repair_date=...)` 不会重写已存在的 (symbol, datetime);
+中断后重跑只能补缺口, 已有的旧版本行要保持覆盖需单独处理 (T-15 就踩过, 用 coalesce 补额).
+
+### 15. 统计脚本要 glob 分片
+`kline_daily` 242 个日期是 `part-stream-*.parquet`, 只 glob `part.parquet` 会误判丢数据.
+
+### 16. 启动日志的两条"错误"是正常的
+- `读 /frontend/package.json 失败, 回退 _FALLBACK_VERSION=0.3.37`
+- `FinancialScheduler skipped: 档位不足`
+
+## 八. 未完成 / 待决策
+
+- **T-04**: 11-20 盘中复验一次 (11-19 当天 14:37 起 DNS 中断, 样本只到 14:37).
+- **T-05 板块资金流**: 东财不可用. 可选: 板块级接口 (行业/概念 3 页, 量小)、
+  其他源、或关票. 需要重新设计后再动手.
+- **T-12 复盘页日期选择**: 需要装 pnpm + 构建前端 + 部署静态产物.
+- **T-10 概念/行业历史**: 大概率关票 (无历史时点成分源).
+- **T-13 假公告日**: 需要一个真实公告日来源 (巨潮/交易所披露表), 未开始.
+- **北交所历史**: 2024 前是 43/83/87 老代码, 需映射; 另案.
+- **分钟历史**: 只能从 2026-11-19 往前攒; 11-18 及更早补不了 (腾讯 1.3 天窗口).
+- 访问密码: 未设 (内网放行, Jimmy 已确认). AI 未接. 补丁未提交, 未自建镜像.
+
+## 九. 关键证据命令
 
 ```bash
-docker exec tsp sh -lc "du -sh /app/data/kline_minute; ls /app/data/kline_minute"
-```
-
-### 4. 本机 curl 必须加 `--noproxy '*'`
-
-否则被 `http_proxy` 截走, 返回 `HTTP 000` (会误判成服务没起来).
-
-### 5. 启动日志里的两条"错误"是正常的
-
-- `读 /frontend/package.json 失败, 回退 _FALLBACK_VERSION=0.3.37` -- 镜像内路径小瑕疵, 回退值正确
-- `FinancialScheduler skipped: 档位不足` / `已配置鉴权但未找到凭据 fuyao_api_key`
-  (后者在配上 fuyao key 后消失)
-
-## 六. 用户目标与对应功能 (Jimmy 明确的三件事)
-
-1. **盘中找机会** -> 异动监控页 (竞价/盘中/偏移) + 监控中心 + 市场环境页. 基本零成本.
-   连板梯队封单走五档 (TdxQuant), 会花积分.
-2. **做T (已有持仓)** -> **批次页** (`frontend/src/custom/lots/Page.tsx`,
-   域名逻辑 `backend/app/strategy/lots.py`): 每笔买入登记 成本价/数量/止盈%/止损%/到期日,
-   自动派生两条监控规则 (到价提醒 + 到期提醒). 零积分.
-   分时图单只按需拉, 1-2 分/只.
-   **不要**开分钟级 `csgi_*` 自动信号: 每分钟为每个标的拉一次数据,
-   监控 10 只票一天就能烧光余额.
-3. **选股** -> 策略 / 因子 / 回测. 数据齐全, 零成本. 这是面板最成熟的部分.
-
-建议路径: 先做「批次登记」验证提醒链路, 再写策略回测, 最后配异动监控.
-
-## 七. 未完成 / 待决策
-
-- 分钟数据: 缺 2026-11-11 一天, 覆盖 5,144/5,893 只. 补齐需 8,350 分, 暂不做.
-- 访问密码: **未设**. 当前是"未设密码 + 内网放行"(`backend/app/main.py:669`),
-  局域网内任何设备可直接访问. Jimmy 已明确局域网无他人, 决定不设.
-- AI 未接. 支持 `openai_compat` / `openai` / `codex_cli`; Claude 需经 LiteLLM, 要批准 (H2).
-- 补丁未提交, 未自建镜像 (长期应做).
-- 多市场改造: 仍未立项 (见 decisions.md 第三节).
-- 分钟同步失败的"整段丢弃"修改: 属改上游代码, 未做.
-
-## 八. 关键证据 (复现时用)
-
-```bash
-# 容器状态
+# 容器
 docker ps --filter name=tsp
+docker inspect tsp --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+docker exec tsp python -c "import socket;print(socket.gethostbyname('qt.gtimg.cn'))"
 
-# 数据落盘
+# 数据
 docker exec tsp sh -lc "du -sh /app/data/* | sort -h | tail"
-
-# 管道任务
-curl -s --noproxy '*' http://127.0.0.1:3018/api/pipeline/jobs?limit=5
+curl -s --noproxy '*' http://127.0.0.1:3018/api/data/status
 
 # 能力路由
 curl -s --noproxy '*' http://127.0.0.1:3018/api/settings/capability-matrix
+curl -s --noproxy '*' http://127.0.0.1:3018/api/capabilities
 
-# 数据状态
-curl -s --noproxy '*' http://127.0.0.1:3018/api/data/status
+# 任务
+curl -s --noproxy '*' 'http://127.0.0.1:3018/api/pipeline/jobs?limit=5'
+
+# 分时 (本地/实时)
+curl -s --noproxy '*' "http://127.0.0.1:3018/api/kline/minute?symbol=000815.SZ&date=2026-11-19"
+curl -s --noproxy '*' "http://127.0.0.1:3018/api/index/minute?symbol=000001.SH&date=2026-11-19"
+
+# 指数历史
+curl -s --noproxy '*' "http://127.0.0.1:3018/api/index/daily?symbol=000001.SH&start_date=2016-01-01&end_date=2016-12-30"
+
+# 财务多期
+curl -s --noproxy '*' "http://127.0.0.1:3018/api/financials/metrics?symbol=600519.SH"
+
+# 连板梯队 / 手动修正五档
+curl -s --noproxy '*' "http://127.0.0.1:3018/api/screener/limit-ladder?direction=up"
+curl -s --noproxy '*' -X POST http://127.0.0.1:3018/api/settings/preferences/limit-ladder-monitor/run
+
+# 手动分钟落盘 (触发管道任务)
+curl -s --noproxy '*' -X POST http://127.0.0.1:3018/api/kline/sync_minute -H 'Content-Type: application/json' -d '{"days":1}'
 ```
 
-- 能力路由权威定义: `backend/app/data_providers/capabilities.py`
-- fuyao 日K补查与回退: `backend/app/plugins/fuyao/provider.py:691` (`_historical_batch_rows`)
-- fuyao 退避补丁: `backend/app/plugins/fuyao/client.py` (`_retry_wait` / `_get`)
-- 管道阶段顺序: `backend/app/jobs/daily_pipeline.py` (Step 0 维表 -> 1 日K -> 1.5 除权
-  -> 2 指标 -> 2.3 指数 -> 2.5 分钟 -> 2.6 环境 -> 2.7 主线 -> 2.8 模拟盘)
-- 分时信号取数: `backend/app/services/quote_service.py:1723` (`_inject_intraday_signals`)
-- TickFlow 免费档 (none) 只提供历史日K; 实时/除权/分钟/五档/财务均需付费档或第三方源
-  (`backend/app/data_providers/capabilities.py` 的 `tf_tier` 字段)
+## 十. 文档索引
+
+- `docs/data-inventory.md` — 数据资产总清单 (单一事实来源)
+- `docs/data-tickets.md` — 工单 T-01 ~ T-15 与验收记录
+- `docs/astock-supply-catalog.md` — a-stock-data 供给清单
+- `docs/astock-m0-realtime-probe.md` — 腾讯 M0 实测 (五档字段/批量上限)
+- `docs/astock-daily-history-backfill-plan.md` — 日K 补数方案 (已执行)
+- `docs/astock-data-verification.md` / `docs/stockdb-data-source-notes.md` — 数据源评测
+- `docs/decisions.md` — 历史决策
+- `CONTRIBUTING.md` / `docs/secondary-development.md` — 改代码前必读
