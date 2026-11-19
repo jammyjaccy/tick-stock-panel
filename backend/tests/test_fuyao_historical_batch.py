@@ -271,14 +271,27 @@ def test_deep_batch_window_splits_without_overlap_or_duplicate_days(monkeypatch)
     assert df["date"].to_list() == [date(2001, 1, 1), DAY]
 
 
-@pytest.mark.parametrize("asset_type", ["index", "etf"])
-def test_non_stock_daily_routing_is_unchanged(monkeypatch, asset_type):
+def test_etf_daily_routing_is_unchanged(monkeypatch):
+    """ETF 仍不由扶摇承担; 指数已在 T-08 接入 (见下一条)。"""
     client = _BatchClient({})
     provider = _provider(monkeypatch, client)
     provider._daily10_for_window = _no_dump
     provider._daily_dump_info = _no_dump
-    assert provider.get_daily(["000001.SH"], None, None, asset_type=asset_type).is_empty()
+    assert provider.get_daily(["510300.SH"], None, None, asset_type="etf").is_empty()
     assert client.batch_calls == client.single_calls == []
+
+
+def test_index_daily_routes_to_single_historical(monkeypatch):
+    """指数逐只走单标的 historical, 不碰股票批量接口。"""
+    monkeypatch.setattr(fp, "_INDEX_HIST_INTERVAL_S", 0.0)
+    client = _BatchClient({"000001.SH": [_bar()]})
+    provider = _provider(monkeypatch, client)
+    provider._daily10_for_window = _no_dump
+    provider._daily_dump_info = _no_dump
+    df = provider.get_daily(["000001.SH"], None, None, asset_type="index")
+    assert not df.is_empty()
+    assert client.batch_calls == []
+    assert [c[0] for c in client.single_calls] == ["000001.SH"]
 
 
 def test_bulk_recent_query_keeps_dump_route(monkeypatch):

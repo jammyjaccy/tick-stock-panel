@@ -66,6 +66,8 @@ _HIST_MAX_SPAN_MS = 3650 * 86_400_000  # historical 单次窗口上限 10 年, �
 # 撞上服务端分钟配额 (HTTP 429, 非信封 code 4001)。0.3 把理论峰值压到
 # ~200/分钟以内, 再配合 client 层 429 退避重试兜底。
 _HIST_INTERVAL_S = 0.3
+# 指数逐只拉取 (599 只) 的额外节流: 0.6 秒约 100 请求/分钟, 低于扶摇配额上限
+_INDEX_HIST_INTERVAL_S = 0.6
 _FINANCIAL_HISTORY_PERIODS = 8  # 财务首装全量历史: 最近 8 期季报(约 2 年)
 _VALUATION_BATCH = 100  # 估值/价格快照端点单次上限 100 只
 # 项目财务表名 → 扶摇报表端点名
@@ -219,7 +221,11 @@ def _cache_dir() -> Path:
 
 
 def _kline_rows(symbol: str, bars: list[dict]) -> list[dict]:
-    """historical/dump 原始行(价格元, volume 股) → 内部行(volume 手)。"""
+    """historical/dump 原始行(价格元, volume 股) → 内部行。
+
+    volume 一律 股 -> 手 (floor /100): 面板内部日K 统一用手, 指数也不例外
+    (存量指数日K 4~6 亿手量级; 个股同样是手)。
+    """
     out = []
     for b in bars:
         v = _to_float(b.get("volume"))
@@ -509,12 +515,32 @@ class FuyaoProvider:
         on_chunk_done: Callable[[int, int], None] | None = None,
     ) -> Iterator[pl.DataFrame]:
         """分批产出日K,供历史同步逐批落盘,避免全市场结果累积在内存。"""
-        if not symbols or asset_type != "stock":
+        if not symbols:
             return
         symbols = list(dict.fromkeys(symbols))
         end_dt = end_time or datetime.now()
         start_dt = start_time or (end_dt - timedelta(days=365))
         start_d, end_d = start_dt.date(), end_dt.date()
+
+        if asset_type == "index":
+            # 指数不受 A 股 dump 覆盖, 逐只走 historical; 成交量同样 股 -> 手
+            total = len(symbols)
+            for i, sym in enumerate(symbols):
+                # 逐只串行, 每只前都等一次: 上限约 100 请求/分钟, 低于扶摇配额
+                time.sleep(_INDEX_HIST_INTERVAL_S)
+                bars = self._historical_bars(sym, start_d, end_d)
+                if on_chunk_done:
+                    on_chunk_done(i + 1, total)
+                if not bars:
+                    continue
+                df = normalize_daily(_kline_rows(sym, bars), source=self.name)
+                if not df.is_empty():
+                    yield df
+            return
+
+        if asset_type != "stock":
+            return
+
         symset = set(symbols)
         prefer_api = len(symbols) <= _HIST_SMALL_SYMBOL_LIMIT
 

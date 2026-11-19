@@ -1593,3 +1593,56 @@ def test_test_dataset_adj_factor_preview(monkeypatch):
     assert out["rows"] == 1
     assert out["preview"][0]["trade_date"] == "2026-06-12"
     assert out["preview"][0]["ex_factor"] == pytest.approx(32.8 / 32.12)
+
+
+# ---- 指数历史日K (T-08) ----
+
+
+def test_index_daily_history_converts_share_to_hand(monkeypatch):
+    """指数历史日K: 上游 volume 是股, 与个股同口径 股→手, 逐只走 historical。
+
+    存量指数日K 是手 (volume/amount 约 13 元/股), 透传股会让成交量放大 100 倍。
+    """
+    fake = _FakeHistClient({"000001.SH": [_bar(date(2020, 1, 2), 3005.0, volume=123_456_789)]})
+    provider = _hist_provider(monkeypatch, fake)
+    monkeypatch.setattr(fp, "_INDEX_HIST_INTERVAL_S", 0.0)
+
+    frames = list(provider.iter_daily(
+        ["000001.SH"], datetime(2020, 1, 1), datetime(2020, 1, 3), asset_type="index",
+    ))
+
+    assert len(frames) == 1
+    row = frames[0].to_dicts()[0]
+    assert row["symbol"] == "000001.SH"
+    assert row["date"] == date(2020, 1, 2)
+    assert row["volume"] == 1_234_567  # floor(123456789 / 100)
+    assert fake.calls[0]["thscode"] == "000001.SH"
+    assert fake.calls[0]["adjust"] == "none"
+
+
+def test_index_daily_history_skips_unsupported_symbol(monkeypatch):
+    """扶摇不认的指数 (如 000013.SH) 返回空帧跳过, 不阻断其他指数。"""
+    fake = _FakeHistClient(
+        {"399001.SZ": [_bar(date(2020, 1, 2), 11000.0, volume=9_876_543)]},
+        error_syms=("000013.SH",),
+    )
+    provider = _hist_provider(monkeypatch, fake)
+    monkeypatch.setattr(fp, "_INDEX_HIST_INTERVAL_S", 0.0)
+
+    frames = list(provider.iter_daily(
+        ["000013.SH", "399001.SZ"], datetime(2020, 1, 1), datetime(2020, 1, 3),
+        asset_type="index",
+    ))
+
+    assert [f["symbol"].to_list() for f in frames] == [["399001.SZ"]]
+    assert frames[0]["volume"].to_list() == [98_765]
+
+
+def test_iter_daily_returns_nothing_for_etf(monkeypatch):
+    """ETF 仍不由扶摇日K承担 (只在 stock/index 两个资产类型有实现)。"""
+    fake = _FakeHistClient({})
+    provider = _hist_provider(monkeypatch, fake)
+    assert list(provider.iter_daily(
+        ["510300.SH"], datetime(2020, 1, 1), datetime(2020, 1, 3), asset_type="etf",
+    )) == []
+    assert fake.calls == []
