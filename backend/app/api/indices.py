@@ -144,8 +144,11 @@ def sync_index_daily(
     """同步指数日K到独立 parquet。"""
     repo = request.app.state.repo
     capset = request.app.state.capabilities
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
-        raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
+    # 门禁按"生效源"判断: 路由到自定义日K源 (fuyao) 时, 没有 TickFlow Pro 档也能同步指数
+    from app.data_providers.capabilities import capability_gate
+    ok, label = capability_gate("daily")
+    if not ok:
+        raise HTTPException(status_code=403, detail=f"指数日K同步不可用: {label}")
     end = datetime.now()
     start = end - timedelta(days=days)
     count = index_sync.sync_index_instruments(repo)

@@ -2163,14 +2163,16 @@ def update_limit_ladder_monitor(req: LimitLadderMonitorIn, request: Request) -> 
 
 @router.post("/preferences/limit-ladder-monitor/run")
 def run_limit_ladder_fix(request: Request) -> dict:
-    """立即手动修正一次真假板(拉取五档盘口 + 更新缓存)。需 Pro+。"""
-    from app.tickflow.capabilities import Cap
-    capset = request.app.state.capabilities
-    capset.require(Cap.DEPTH5_BATCH)  # 无能力抛 CapabilityDenied(403)
+    """立即手动修正一次真假板(拉取五档盘口 + 更新缓存)。
 
+    门禁用生效源的深度能力 (capability_gate), 而不是只看 TickFlow 档位:
+    五档路由到插件 (如 tencent_depth) 时 TickFlow 档位无关。
+    """
     depth_svc = getattr(request.app.state, "depth_service", None)
     if not depth_svc:
         raise HTTPException(status_code=503, detail="depth 服务未初始化")
+    if not depth_svc._has_capability():
+        raise HTTPException(status_code=403, detail=depth_svc._capability_label())
     result = depth_svc.run_once()
     # sealed 数据变了, 清看板总览缓存, 否则看板在 TTL 窗口内仍返回旧的 limit_up/fake 等
     if result.get("ok"):
