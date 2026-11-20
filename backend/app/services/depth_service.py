@@ -43,6 +43,18 @@ from app.tickflow.rate_limits import (
 logger = logging.getLogger(__name__)
 
 
+def _has_volume(cache: dict) -> bool:
+    """快照里是否还有真实挂单量。
+
+    收盘后腾讯 qt.gtimg.cn 会把五档成交量清零 (只剩买一价), 这种快照不能
+    覆盖盘中数据, 也不能直接定版。
+    """
+    return any(
+        (e.get("bid1_vol") or 0) > 0 or (e.get("ask1_vol") or 0) > 0
+        for e in cache.values()
+    )
+
+
 # 套餐 → (轮询间隔下限s, 上限s)
 TIER_INTERVAL_RANGE: dict[str, tuple[float, float]] = {
     "pro": (10.0, 120.0),
@@ -216,10 +228,29 @@ class DepthService:
         """
         prepared = self._fetch_depth_snapshot()
         if prepared is None:
+            if persist:
+                self._finalize_from_cache()
             return
         depth_data, syms_up, syms_down, enriched_date = prepared
         with self._fetch_lock:
             self._seal_locked(depth_data, syms_up, syms_down, enriched_date, persist)
+
+    def _finalize_from_cache(self) -> None:
+        """定版拉取为空时的兜底: 用盘中最后一盘缓存落盘。
+
+        收盘后腾讯五档成交量会被清零 (只剩买一价), 15:02 定版可能拉到空快照。
+        不能因此丢掉当天封单, 但只能沿用同一天且有量的缓存。
+        """
+        with self._lock:
+            cache = dict(self._sealed_cache)
+            day = self._sealed_date
+        if day and cache and _has_volume(cache):
+            logger.warning(
+                "depth sealed: 定版拉取为空, 沿用盘中最后一盘 %d 只 (日期=%s)", len(cache), day,
+            )
+            self._persist(day)
+        else:
+            logger.warning("depth sealed: 定版拉取为空且无可沿用的盘中缓存, 今日不落盘")
 
     def _fetch_depth_snapshot(self):
         """锁外阶段: 读 enriched 涨跌停名单 + 批量拉取 depth (网络调用不进锁)。"""
@@ -282,6 +313,23 @@ class DepthService:
                 "fetched_ts": fetched,
             }
             new_cache[sym] = entry
+
+        # 收盘后五档量清零 → 新快照没有可用挂单量。此时保留盘中最后一盘,
+        # 否则一次收盘后的拉取会把当天封单全改成 0 并定版成 0。
+        if not _has_volume(new_cache):
+            with self._lock:
+                prev_cache = dict(self._sealed_cache)
+                prev_day = self._sealed_date
+            if prev_day == enriched_date and prev_cache and _has_volume(prev_cache):
+                logger.warning(
+                    "depth sealed: 五档成交量已清零, 保持盘中最后一盘 %d 只 (日期=%s)%s",
+                    len(prev_cache), prev_day, " → 落盘" if persist else "",
+                )
+                if persist:
+                    self._persist(enriched_date)
+            else:
+                logger.warning("depth sealed: 快照无成交量且无可沿用的盘中缓存, 本轮跳过")
+            return
 
         with self._lock:
             self._sealed_cache = new_cache
