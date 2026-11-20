@@ -95,15 +95,41 @@ def _bare(col: str = "symbol") -> pl.Expr:
     return pl.col(col).cast(pl.String).str.strip_chars().str.split(".").list.first()
 
 
+# 盘中 live 分时只为"用户打开过的个股"落盘, 当天分区可能只有几只票。
+# 板块轮动拿这种残缺分区聚合, 会从多根线塌成一根线 (2026-11-20 实测: 1 只票)。
+# 判定用相对口径: 某盘标的数不足近几盘最大值的 50% 视为残缺, 回退到完整的那盘。
+_MINUTE_PARTITION_LOOKBACK = 5
+_MIN_MINUTE_SYMBOL_RATIO = 0.5
+
+
+def _minute_partition_symbols(path: Path) -> int:
+    try:
+        return pl.read_parquet(path, columns=["symbol"])["symbol"].n_unique()
+    except Exception:
+        return 0
+
+
 def _latest_minute_partition(minute_dir: Path) -> str | None:
     if not minute_dir.exists():
         return None
-    parts = sorted(
+    dates = sorted(
         d.name[5:]
         for d in minute_dir.iterdir()
         if d.is_dir() and d.name.startswith("date=") and (d / "part.parquet").is_file()
     )
-    return parts[-1] if parts else None
+    if not dates:
+        return None
+    recent = dates[-_MINUTE_PARTITION_LOOKBACK:]
+    counts = {d: _minute_partition_symbols(minute_dir / f"date={d}" / "part.parquet") for d in recent}
+    reference = max(counts.values(), default=0)
+    if reference <= 0:
+        return dates[-1]
+    threshold = reference * _MIN_MINUTE_SYMBOL_RATIO
+    for day in reversed(recent):
+        if counts[day] >= threshold:
+            return day
+    # 所有近盘都残缺: 退回最新, 与旧行为一致 (fail-open, 不返回 None)
+    return dates[-1]
 
 
 def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
