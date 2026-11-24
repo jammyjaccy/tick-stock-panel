@@ -5,7 +5,7 @@
 - `docs/data-inventory.md` — 数据资产总清单 (单一事实来源)
 - `docs/data-tickets.md` — 工单 T-01 ~ T-15 与验收证据
 
-更新时间: 2026-11-20 17:40
+更新时间: 2026-11-24 15:35
 
 ---
 
@@ -32,12 +32,14 @@ docker run -d --name tsp \
   -e DATA_DIR=/app/data \
   --dns 223.5.5.5 --dns 119.29.29.29 \
   -v /home/workspace/tickflow-data:/app/data \
+  -v /home/workspace/tickflow-stock-panel/frontend/dist:/app/static:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/plugins/fuyao/client.py:/app/app/plugins/fuyao/client.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/plugins/fuyao/provider.py:/app/app/plugins/fuyao/provider.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/services/instrument_sync.py:/app/app/services/instrument_sync.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/services/ext_data.py:/app/app/services/ext_data.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/services/sector_rotation.py:/app/app/services/sector_rotation.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/services/depth_service.py:/app/app/services/depth_service.py:ro \
+  -v /home/workspace/tickflow-stock-panel/backend/app/jobs/daily_pipeline.py:/app/app/jobs/daily_pipeline.py:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/plugins/tencent_depth:/app/app/plugins/tencent_depth:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/plugins/tencent_minute:/app/app/plugins/tencent_minute:ro \
   -v /home/workspace/tickflow-stock-panel/backend/app/api/settings.py:/app/app/api/settings.py:ro \
@@ -47,10 +49,12 @@ docker run -d --name tsp \
   ghcr.io/shy3130/tick-stock-panel@sha256:d1230fb1ea0e4d533d2e3b09fdbdc1563acf41950cb75bff1508aeadb4b50f83
 ```
 
-**十一个挂载, 少一个就失效**:
+**十三个挂载 (不含数据目录), 少一个就失效**:
 
 | 挂载 | 作用 |
 |---|---|
+| frontend/dist | 前端构建产物 (成交量单位"亿手/万手"); 替换镜像内 `/app/static` |
+| app/jobs/daily_pipeline.py | 五档定版重试 (+8/+18 分钟) 与收盘完整性检查 (+25 分钟) |
 | fuyao/client.py | 429/5xx 退避重试, 实时快照不重试 |
 | fuyao/provider.py | 单标的节流 0.3 秒; 指数历史逐只拉 (0.6 秒), 股->手 |
 | instrument_sync.py | 单市场 503 时沿用历史维表, 不再抹掉北交所 |
@@ -68,6 +72,9 @@ docker run -d --name tsp \
    15:02 五档定版与 15:35 管道静默失败.
 2. 单文件挂载跟 inode: 宿主上"写临时文件再 rename"的编辑器改完, 容器里还是旧内容,
    必须 `docker rm -f` + `docker run` 重建; 目录挂载不受影响.
+3. **断电/重启会清空五档内存缓存**. 2026-11-24 14:45 宿主断电, 14:54 恢复后重启容器,
+   启动耗时约 8 分钟, 15:02 定版时缓存已空、腾讯又处收盘空窗 -> 当日五档未落盘
+   (15:24 人工补 67 只). 重启后务必确认 `depth5/date=今天` 是否有数据.
 
 ## 三. 代码改动 (已提交到 main, 未 push)
 
@@ -84,6 +91,7 @@ docker run -d --name tsp \
 | `ad7b2d01` | 扩展源认 `sh600000` 前缀代码 (+8 测试) |
 | `9c662087` | 残缺分钟分区回退到完整交易日 (+6 测试) |
 | `10fa40f5` | 收盘后五档量清零时定版沿用盘中最后一盘 (+6 测试) |
+| (未提交) | depth5 定版覆盖度护栏 + 有当日缓存直接定版 (+4 测试) |
 
 测试 (容器内, 实测):
 
@@ -117,7 +125,8 @@ docker run --rm \
 财务三表     5,580 只 x 8 期; 核心指标 43,456 行 / 8 期 (2024-12-31 ~ 2026-09-30); 股本 0
 分钟K        6 天 (11-12/13/16/17/19/20); 11-20 = 1,256,624 行 / 5,216 只 / 09:30~15:00
 板块资金流   36 盘 / 232,344 行 (2026-11-20); 每盘 6,454 条, 覆盖维表 99.42%
-五档封单     11-18: 91 行, 11-19: 111 行; **11-20 缺失** (定版 bug, 已修, 11-23 复验)
+五档封单     11-18: 91 行, 11-19: 111 行; 11-20 / 11-23 缺失 (定版 bug, 不可回补);
+             **11-24: 67 行 (15:24 人工补, 自动定版因断电重启未成)**
 龙虎榜       最近 60 个交易日 (2026-08-19 ~ 11-18 回补 + 按需)
 扩展表       概念 5,584 行 / 行业 5,580 行 (每日快照, 无历史)
 ```
@@ -147,7 +156,7 @@ minute_sync_enabled       = true
 minute_sync_days          = 1
 minute_data_provider      = tencent_minute
 depth5_data_provider      = tencent_depth
-limit_ladder_monitor_enabled = false   (11-19 盘中临时开过, 收盘已关)
+limit_ladder_monitor_enabled = true    (11-23 起交易时段常开, 收盘后轮询自动跳过)
 depth_polling_interval    = 10.0
 ```
 
@@ -155,21 +164,21 @@ depth_polling_interval    = 10.0
 
 | 票 | 内容 | 状态 |
 |---|---|---|
-| T-01 | 日K 历史导入 | 已验证 (2,431 天) |
-| T-02 | 除权因子历史 | 已验证 (35,462 行) |
-| T-03 | 指标/环境/主线重算 | 已验证 |
-| T-04 | 五档封单 (腾讯) | 盘中已验证 (11-20 全天 5 个采样点, age 3~7 秒); **定版 bug 已修, 11-23 复验落盘** |
-| T-05 | 板块资金流 | **已验证** (新浪扩展表; 36 盘 / 232,344 行; flow_available=true) |
+| T-01 | 日K 历史导入 | **已关闭 (2026-11-20)**; 2,431 天 |
+| T-02 | 除权因子历史 | **已关闭 (2026-11-20)**; 35,462 行 |
+| T-03 | 指标/环境/主线重算 | **已关闭 (2026-11-20)** |
+| T-04 | 五档封单 (腾讯) | 盘中已验证 (11-20 / 11-23 / 11-24 全天); **11-24 15:02 自动定版因宿主断电重启失败, 15:24 人工补 67 只; 兜底待做** |
+| T-05 | 板块资金流 | **已关闭 (2026-11-20)**; 新浪扩展表, 36 盘 / 232,344 行 |
 | T-06 | 龙虎榜回补 | 数据完成; 页面入口待 T-12 |
-| T-07 | 指数分时 | 已验证 (页面确认) |
-| T-08 | 指数K线历史 | 已验证 (2,647 天, 30 只扶摇不支持) |
-| T-09 | 财务指标历史 | 已验证 (8 期 / 43,456 行) |
-| T-10 | 概念/行业历史归属 | 未做, 可能关票 |
-| T-11 | 分钟历史 | 已被 T-15 替代 |
+| T-07 | 指数分时 | **已关闭 (2026-11-20)**; 页面确认 |
+| T-08 | 指数K线历史 | **已关闭 (2026-11-20)**; 2,647 天, 30 只扶摇不支持 |
+| T-09 | 财务指标历史 | **已关闭 (2026-11-20)**; 8 期 / 43,456 行 |
+| T-10 | 概念/行业历史归属 | 未做, 待批准关票 (Jimmy 暂不关) |
+| T-11 | 分钟历史 | **已关闭 (由 T-15 替代)** |
 | T-12 | 复盘页龙虎榜日期选择 | 卡在 pnpm/前端构建 |
 | T-13 | 财务 announce_date 假公告日 | 候补 |
-| T-14 | 腾讯分钟源 | 已验证 (页面确认) |
-| T-15 | 分钟历史落盘 | 已验证 (125.7 万行/241 根/额 100%) |
+| T-14 | 腾讯分钟源 | **已关闭 (2026-11-20)**; 页面确认 |
+| T-15 | 分钟历史落盘 | **已关闭 (2026-11-20)**; 125.7 万行/241 根/额 100% |
 
 ## 六. 用户目标与对应功能
 
@@ -206,9 +215,11 @@ depth_polling_interval    = 10.0
 否则被 http_proxy 截走, 返回 HTTP 000 (会误判成服务没起来).
 
 ### 8. 指数成交量单位 (股 vs 手)
-扶摇 `historical` 的指数 volume 是**股**, 面板内部统一**手**; 但快照接口的指数 volume
-已经是手. T-08 已把历史统一 `floor(股/100)`, 并修掉存量 2026-11-17/18 的 8 只核心指数.
-判断口径: `volume / amount` 约 0.0007 手/元 (约 13 元/股) 才对.
+扶摇 `historical` 的指数 volume 是**股**, 面板内部统一**手**; **指数快照同样是股**
+(2026-11-24 实测, 此前"快照已是手"的判断是错的). 历史与快照两条路径都已 `floor(股/100)`
+(`712d871f` / 2026-11-24 provider 修复). 2026-11-19 存量 8 只核心指数已补, 11-24 快照已恢复.
+判断口径: `volume / amount` 约 0.0007 手/元 (约 14 元/股) 才对;
+若约 0.06 说明存成了股 (放大 100 倍).
 
 ### 9. 指数日K同步会跑 599 次请求
 `iter_daily(asset_type="index")` 逐只拉, 0.6 秒/只; 每日管道指数阶段约 10 分钟. 属预期成本.
@@ -265,18 +276,45 @@ depth_polling_interval    = 10.0
 盘中看卡片时: 资金流是今天的, 涨幅可能是昨天的 (或今天半量的).
 不要跨列做横向比较; 收盘管道跑完才对齐.
 
+### 22. 15:02 定版会拿到残缺快照 (不只是清零)
+2026-11-23 实测: 15:02 腾讯对 159 只涨跌停只返回 2 只北交所 (沪深价格字段被重置为 0,
+解析层按"两侧全 0"丢弃). 这 2 只有量, 旧护栏 (`_has_volume` 任意一只有量即真) 放行,
+2 行覆盖了 14:59:59 的 157 只缓存并定版. 15:15 复探又恢复正常, 是收盘后的短暂空窗.
+已修: 覆盖度低于当日涨跌停名单 50% 视为残缺; 定版有当日有量缓存就直接落缓存.
+**定版依赖盘中有缓存**: 监控开关 `limit_ladder_monitor_enabled` 现为交易时段常开.
+
+### 23. 断电/重启后 15:02 定版必失 (待兜底)
+2026-11-24 14:45 宿主断电, 14:54 来电后重启; 新进程启动到五档初始化用了约 8 分钟
+(DuckDB 视图 + enriched warmup), 15:02:38 才走到 `启动补跑今天定版`, 此时:
+内存缓存已随进程丢失, 15:02 腾讯又是收盘空窗, 拉取为空 -> `今日不落盘`.
+15:24 复探腾讯已恢复, 手动补数 (`/api/settings/preferences/limit-ladder-monitor/run`)
+落 67 行 (63 涨停 + 4 跌停), 覆盖率 67/67. 但人工补的是 15:24 盘后快照, 非 14:59 盘中缓存
+(尾盘封单会真实变化, 例: 603960 14:45 382,560 手 -> 收盘 10,019 手, 腾讯/新浪一致).
+**兜底方案 (代码已实现, 深度测试 38 passed, 待部署)**:
+1. 盘中每 5 分钟把当前 seal 快照写 `cache/depth5_intraday/date=今天.parquet`
+   (放 depth5 视图外, 避免被 DuckDB view 重复计入); 定版/启动补跑时内存缓存为空则回退读它.
+2. 定版重试: 15:10 / 15:20 各跑一次 `finalize_if_needed` (当天已有文件则跳过).
+3. 收盘完整性检查: 15:27 检查 `depth5/date=今天` 是否存在、行数是否 >= 当日涨跌停一半,
+   缺失/残缺写 `alerts.jsonl` + 系统通知.
+4. 部署需重建容器并新增 `app/jobs/daily_pipeline.py` 挂载, 否则定时任务还是旧的.
+
 ## 八. 未完成 / 待决策
 
-- **T-04**: 盘中 11-20 已复验 (10:30/11:25/13:05/14:35/14:55 五个采样点).
-  当天定版因收盘后五档量清零而缺失, 修复已上线, **11-23 15:02 复验落盘**.
-- **T-05 板块资金流**: 已完成 (新浪个股资金流扩展表). 东财方案已废弃.
+已关闭 (2026-11-20, Jimmy 确认): T-01 / T-02 / T-03 / T-05 / T-07 / T-08 / T-09 /
+T-11 (由 T-15 替代) / T-14 / T-15.
+
+- **T-04**: 盘中 11-20 / 11-23 / 11-24 均已复验 (11-24: 上午 380 次 + 下午 616 次轮询,
+  0 失败). 11-24 15:02 自动定版**失败**: 14:45 宿主断电, 14:54 重启, 启动约 8 分钟,
+  15:02 时缓存已空且腾讯收盘空窗 -> 未落盘; 15:24 人工补 67 只 (覆盖 67/67).
+  **待做兜底**: 盘中定期落盘 + 定版重试 + 收盘完整性告警 (见坑 23).
+- **T-05 板块资金流**: 已关闭 (新浪个股资金流扩展表). 东财方案已废弃.
   已知限制: 盘中分钟未全量落盘时, 涨幅与资金流不同日 (见坑 21).
 - **T-12 复盘页日期选择**: 需要装 pnpm + 构建前端 + 部署静态产物.
 - **T-10 概念/行业历史**: 大概率关票 (无历史时点成分源).
 - **T-13 假公告日**: 需要一个真实公告日来源 (巨潮/交易所披露表), 未开始.
 - **北交所历史**: 2024 前是 43/83/87 老代码, 需映射; 另案.
 - **分钟历史**: 只能从 2026-11-19 往前攒; 11-18 及更早补不了 (腾讯 1.3 天窗口).
-- 访问密码: 未设 (内网放行, Jimmy 已确认). AI 未接. 补丁未提交, 未自建镜像.
+- 访问密码: 未设 (内网放行, Jimmy 已确认). AI 已接入 (Jimmy, 2026-11-20). 补丁未提交, 未自建镜像.
 
 ## 九. 关键证据命令
 
