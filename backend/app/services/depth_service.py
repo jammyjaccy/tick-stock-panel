@@ -68,6 +68,15 @@ DEFAULT_RANGE = (10.0, 120.0)
 INTERVAL_HARD_MIN = 10.0
 INTERVAL_HARD_MAX = 300.0
 
+# 快照覆盖率下限: 低于当日涨跌停名单的这个比例视为残缺快照。
+# 2026-11-23 实测: 15:02 定版对 159 只涨跌停只返回 2 只(腾讯先重置价格字段再恢复),
+# 有量但有覆盖不足, 不能用来覆盖盘中缓存或定版。
+COVERAGE_MIN_RATIO = 0.5
+
+# 盘中快照落盘间隔(秒): 断电/重启会清空内存缓存, 定版时回退读这份快照。
+# 5 分钟一盘, 一整天才 48 次小文件写 (每次不足百行), 代价可忽略。
+INTRADAY_SNAPSHOT_INTERVAL_S = 300.0
+
 
 class DepthService:
     """五档盘口 sealed 服务 — 单例。"""
@@ -91,6 +100,7 @@ class DepthService:
         self._sealed_fetched_ts: float = 0.0   # 上次拉取的 perf_counter
         self._sealed_fetched_at: float = 0.0   # 上次拉取的 wall-clock 时间戳
         self._persisted_date: date | None = None  # 已落盘的日期
+        self._last_intraday_snapshot: float = 0.0  # 上次写盘中快照的 perf_counter
 
         # 系统接管状态(防通知刷屏)
         self._last_taken_over: bool | None = None
@@ -249,8 +259,11 @@ class DepthService:
                 "depth sealed: 定版拉取为空, 沿用盘中最后一盘 %d 只 (日期=%s)", len(cache), day,
             )
             self._persist(day)
+        elif self._restore_intraday_snapshot(cn_today()):
+            logger.warning("depth sealed: 定版拉取为空, 沿用盘中落盘快照 (日期=%s)", cn_today())
+            self._persist(cn_today())
         else:
-            logger.warning("depth sealed: 定版拉取为空且无可沿用的盘中缓存, 今日不落盘")
+            logger.warning("depth sealed: 定版拉取为空且无可沿用的盘中数据, 今日不落盘")
 
     def _fetch_depth_snapshot(self):
         """锁外阶段: 读 enriched 涨跌停名单 + 批量拉取 depth (网络调用不进锁)。"""
@@ -314,21 +327,29 @@ class DepthService:
             }
             new_cache[sym] = entry
 
-        # 收盘后五档量清零 → 新快照没有可用挂单量。此时保留盘中最后一盘,
-        # 否则一次收盘后的拉取会把当天封单全改成 0 并定版成 0。
-        if not _has_volume(new_cache):
+        # 收盘后五档量清零 → 新快照没有可用挂单量; 或收盘后腾讯重置价格字段 →
+        # 只返回极少数标的(覆盖残缺)。两种都不能覆盖盘中最后一盘, 否则当天封单
+        # 会被改成 0 或只剩零星几只并定版。
+        expected = len(up_set | down_set)
+        degraded = expected > 0 and len(new_cache) < expected * COVERAGE_MIN_RATIO
+        if not _has_volume(new_cache) or degraded:
             with self._lock:
                 prev_cache = dict(self._sealed_cache)
                 prev_day = self._sealed_date
+            reason = (
+                "五档成交量已清零"
+                if not _has_volume(new_cache)
+                else f"快照残缺({len(new_cache)}/{expected} 只)"
+            )
             if prev_day == enriched_date and prev_cache and _has_volume(prev_cache):
                 logger.warning(
-                    "depth sealed: 五档成交量已清零, 保持盘中最后一盘 %d 只 (日期=%s)%s",
-                    len(prev_cache), prev_day, " → 落盘" if persist else "",
+                    "depth sealed: %s, 保持盘中最后一盘 %d 只 (日期=%s)%s",
+                    reason, len(prev_cache), prev_day, " → 落盘" if persist else "",
                 )
                 if persist:
                     self._persist(enriched_date)
             else:
-                logger.warning("depth sealed: 快照无成交量且无可沿用的盘中缓存, 本轮跳过")
+                logger.warning("depth sealed: %s 且无可沿用的盘中缓存, 本轮跳过", reason)
             return
 
         with self._lock:
@@ -344,6 +365,10 @@ class DepthService:
 
         # 缓存已更新: 通知 SSE 推 depth_updated, 触发连板梯队刷新封单数据。
         self._notify_depth_updated(len(new_cache))
+
+        # 盘中每 5 分钟把当前盘口落一份快照, 断电/重启后定版可回退。
+        if not persist:
+            self._maybe_persist_intraday(enriched_date)
 
         if persist and enriched_date:
             self._persist(enriched_date)
@@ -403,22 +428,115 @@ class DepthService:
         return result
 
     def finalize(self) -> None:
-        """盘后定版: 拉一次 + 落盘。"""
+        """盘后定版: 有当日盘中有量缓存就直接落盘, 没有才重拉一次。
+
+        连续竞价 15:00 结束, 14:59 的盘中缓存才是收盘真实状态; 15:02 收盘后
+        重拉腾讯五档可能拿到残缺快照 (2026-11-23: 159 只只要到 2 只)。因此
+        只要缓存是当天的且有挂单量, 就以缓存定版, 不再让重拉结果覆盖它。
+        """
         if not self._has_capability():
             return
+        with self._lock:
+            cache = dict(self._sealed_cache)
+            day = self._sealed_date
+        today = cn_today()
+        if day == today and cache and _has_volume(cache):
+            logger.info(
+                "depth sealed: 定版使用盘中最后一盘 %d 只 (日期=%s)", len(cache), day,
+            )
+            self._persist(day)
+            return
+        # 断电/重启: 内存缓存已丢, 回退到盘中定期落盘的快照。
+        if self._restore_intraday_snapshot(today):
+            with self._lock:
+                n = len(self._sealed_cache)
+            logger.info(
+                "depth sealed: 定版使用盘中落盘快照 %d 只 (日期=%s)", n, today,
+            )
+            self._persist(today)
+            return
         self._fetch_and_seal(persist=True)
+
+    def finalize_if_needed(self) -> None:
+        """定版重试: 当天已有定版文件就跳过, 否则再跑一次 finalize。"""
+        if not self._has_capability():
+            return
+        today = cn_today()
+        if self._persisted_for_date(today):
+            return
+        logger.info("depth sealed: 定版重试 (当天文件仍缺失)")
+        self.finalize()
+
+    def close_integrity_check(self) -> dict:
+        """收盘完整性检查: 当天 depth5 缺失或覆盖不足当天涨跌停一半 -> 告警。"""
+        today = cn_today()
+        rows = 0
+        expected = 0
+        if self._repo:
+            out = self._repo.store.data_dir / "depth5" / f"date={today.isoformat()}" / "part.parquet"
+            if out.exists():
+                try:
+                    rows = pl.read_parquet(out).height
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("depth5 完整性检查读取失败: %s", e)
+            try:
+                enriched, enriched_date = self._repo.get_enriched_latest()
+                if enriched_date == today and not enriched.is_empty():
+                    for col in ("signal_limit_up", "signal_limit_down"):
+                        if col in enriched.columns:
+                            expected += int(enriched.filter(pl.col(col).fill_null(False)).height)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("depth5 完整性检查取涨跌停名单失败: %s", e)
+        ok = rows > 0 and (expected == 0 or rows >= expected * COVERAGE_MIN_RATIO)
+        result = {
+            "date": today.isoformat(),
+            "rows": rows,
+            "expected": expected,
+            "ok": ok,
+        }
+        if ok:
+            logger.info("depth5 收盘完整性检查通过: %d 行 (当日涨跌停 %d 只)", rows, expected)
+        else:
+            logger.error("depth5 收盘完整性检查失败: %d 行 (当日涨跌停 %d 只)", rows, expected)
+            self._alert_close_integrity(result)
+        return result
+
+    def _alert_close_integrity(self, result: dict) -> None:
+        """把缺失/残缺写进告警中心并弹系统通知 (失败静默, 不阻断)。"""
+        title = "五档收盘数据缺失" if result["rows"] == 0 else "五档收盘覆盖不足"
+        body = f"{result['date']} 五档定版 {result['rows']}/{result['expected']} 只"
+        if self._repo:
+            try:
+                from app.services import alert_store
+
+                alert_store.append(self._repo.store.data_dir, {
+                    "ts": int(time.time() * 1000),
+                    "rule_id": "depth5_close_integrity",
+                    "rule_name": "五档收盘完整性",
+                    "source": "depth5",
+                    "type": title,
+                    "symbol": "",
+                    "name": "",
+                    "message": body,
+                    "severity": "error",
+                    "signals": [],
+                    "conditions": [],
+                    "logic": "and",
+                })
+            except Exception as e:  # noqa: BLE001
+                logger.warning("depth5 完整性告警落盘失败: %s", e)
+        try:
+            from app.services import notify_adapter
+
+            notify_adapter.notify(title, body)
+        except Exception:  # noqa: BLE001
+            logger.debug("depth5 完整性系统通知失败")
 
     # ================================================================
     # 落盘
     # ================================================================
 
-    def _persist(self, today: date) -> None:
-        """把内存缓存写 depth5/date=今天/part.parquet。"""
-        with self._lock:
-            cache = dict(self._sealed_cache)
-        if not cache:
-            return
-
+    def _cache_frame(self, cache: dict) -> pl.DataFrame:
         rows = []
         for sym, e in cache.items():
             rows.append({
@@ -433,7 +551,7 @@ class DepthService:
         # 显式 schema: sealed_up/sealed_down 是 bool 与 None 混合, 不指定 schema
         # polars 会按首行推断类型, 后续遇到不一致 (bool vs null) 报
         # "could not append value: false of type: bool to the builder"。
-        df = pl.DataFrame(rows, schema={
+        return pl.DataFrame(rows, schema={
             "symbol": pl.Utf8,
             "sealed_up": pl.Boolean,
             "sealed_down": pl.Boolean,
@@ -442,15 +560,93 @@ class DepthService:
             "status": pl.Utf8,
             "fetched_at": pl.Float64,
         })
-        ds = today.isoformat()
-        out = self._repo.store.data_dir / "depth5" / f"date={ds}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        # 原子写: 先写临时文件再 os.replace, 避免读侧 (get_sealed_map) 读到半写 parquet
-        tmp = out.with_name(out.name + ".tmp")
+
+    def _write_cache(self, path: Path, cache: dict) -> int | None:
+        """原子写缓存到 path; 空缓存返回 None。"""
+        if not cache:
+            return None
+        df = self._cache_frame(cache)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 原子写: 先写临时文件再 os.replace, 避免读侧读到半写 parquet
+        tmp = path.with_name(path.name + ".tmp")
         df.write_parquet(tmp)
-        os.replace(tmp, out)
+        os.replace(tmp, path)
+        return df.height
+
+    def _persist(self, today: date) -> None:
+        """把内存缓存写 depth5/date=今天/part.parquet。"""
+        with self._lock:
+            cache = dict(self._sealed_cache)
+        out = self._repo.store.data_dir / "depth5" / f"date={today.isoformat()}" / "part.parquet"
+        try:
+            rows = self._write_cache(out, cache)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("depth sealed 落盘失败: %s", e)
+            return
+        if rows is None:
+            return
         self._persisted_date = today
-        logger.info("depth sealed 落盘: %d 行 → %s", df.height, out)
+        logger.info("depth sealed 落盘: %d 行 → %s", rows, out)
+        # 定版成功后清掉盘中快照, 避免下次误用旧数据
+        try:
+            self._snapshot_path(today).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _snapshot_path(self, d: date) -> Path:
+        """盘中快照路径: 放在 depth5 视图之外, 避免被 DuckDB view 重复计入。"""
+        return self._repo.store.data_dir / "cache" / "depth5_intraday" / f"date={d.isoformat()}.parquet"
+
+    def _maybe_persist_intraday(self, d: date) -> None:
+        """盘中定期把当前盘口快照写到磁盘 (断电/重启后定版可回退)。"""
+        now = time.perf_counter()
+        if now - self._last_intraday_snapshot < INTRADAY_SNAPSHOT_INTERVAL_S:
+            return
+        with self._lock:
+            cache = dict(self._sealed_cache)
+        try:
+            n = self._write_cache(self._snapshot_path(d), cache)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("depth sealed 盘中快照写入失败: %s", e)
+            return
+        if n:
+            self._last_intraday_snapshot = now
+            logger.debug("depth sealed 盘中快照: %d 行 (日期=%s)", n, d)
+
+    def _restore_intraday_snapshot(self, d: date) -> bool:
+        """从盘中定时落盘的快照恢复内存缓存; 无文件/无挂单量返回 False。"""
+        if not self._repo:
+            return False
+        path = self._snapshot_path(d)
+        if not path.exists():
+            return False
+        try:
+            df = pl.read_parquet(path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("depth sealed 盘中快照读取失败: %s", e)
+            return False
+        cache: dict[str, dict] = {}
+        for row in df.to_dicts():
+            sym = row.get("symbol")
+            if not sym:
+                continue
+            cache[sym] = {
+                "sealed_up": row.get("sealed_up"),
+                "sealed_down": row.get("sealed_down"),
+                "ask1_vol": row.get("ask1_vol"),
+                "bid1_vol": row.get("bid1_vol"),
+                "status": row.get("status"),
+                "fetched_ts": row.get("fetched_at"),
+            }
+        if not cache or not _has_volume(cache):
+            return False
+        with self._lock:
+            self._sealed_cache = cache
+            self._sealed_ready = True
+            self._sealed_date = d
+            self._sealed_fetched_ts = 0.0
+        logger.info("depth sealed: 从盘中快照恢复 %d 只 (日期=%s)", len(cache), d)
+        return True
 
     def _persisted_for_date(self, d: date) -> bool:
         """检查某日 depth5 文件是否已存在。"""

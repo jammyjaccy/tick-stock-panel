@@ -2213,15 +2213,29 @@ def update_depth_finalize_time(req: DepthFinalizeTimeIn, request: Request) -> di
     from apscheduler.triggers.cron import CronTrigger
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler:
-        scheduler.reschedule_job(
-            "depth_finalize",
-            trigger=CronTrigger(
-                day_of_week="mon-fri",
-                hour=sched["hour"],
-                minute=sched["minute"],
-                timezone="Asia/Shanghai",
-            ),
-        )
+        # 定版 + 两个重试 + 完整性检查共用同一基准时间, 改时间要一起搬。
+        for job_id, offset in (
+            ("depth_finalize", 0),
+            ("depth_finalize_retry1", 8),
+            ("depth_finalize_retry2", 18),
+            ("depth_integrity_check", 25),
+        ):
+            total = sched["hour"] * 60 + sched["minute"] + offset
+            if total > 18 * 60:
+                continue
+            hour, minute = divmod(total, 60)
+            try:
+                scheduler.reschedule_job(
+                    job_id,
+                    trigger=CronTrigger(
+                        day_of_week="mon-fri",
+                        hour=hour,
+                        minute=minute,
+                        timezone="Asia/Shanghai",
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("reschedule %s failed: %s", job_id, e)
         logger.info("depth_finalize rescheduled to %02d:%02d mon-fri", sched["hour"], sched["minute"])
 
     return sched

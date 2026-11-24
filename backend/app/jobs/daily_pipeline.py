@@ -1404,6 +1404,44 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         replace_existing=True,
     )
 
+    # 五档兜底: 定版空手时重试 + 收盘完整性检查 (缺失/残缺不再静默)。
+    # 偏移相对定版时间: +8/+18 分钟重试 (腾讯 15:02 收盘空窗约 15 分钟恢复);
+    # +25 分钟做完整性检查, 避免重试窗口内误报。
+    def _depth_job_times(offset_min: int) -> tuple[int, int] | None:
+        total = depth_sched["hour"] * 60 + depth_sched["minute"] + offset_min
+        if total > 18 * 60:  # 偏好允许的最晚定版时间 18:00
+            return None
+        return divmod(total, 60)
+
+    def _depth_finalize_retry():
+        state = _get_app_state()
+        depth_svc = getattr(state, "depth_service", None) if state else None
+        if depth_svc:
+            depth_svc.finalize_if_needed()
+
+    def _depth_integrity_check():
+        state = _get_app_state()
+        depth_svc = getattr(state, "depth_service", None) if state else None
+        if depth_svc:
+            depth_svc.close_integrity_check()
+
+    for job_id, offset, job_fn in (
+        ("depth_finalize_retry1", 8, _depth_finalize_retry),
+        ("depth_finalize_retry2", 18, _depth_finalize_retry),
+        ("depth_integrity_check", 25, _depth_integrity_check),
+    ):
+        hm = _depth_job_times(offset)
+        if hm is None:
+            continue
+        scheduler.add_job(
+            job_fn,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=hm[0], minute=hm[1],
+                                timezone="Asia/Shanghai"),
+            id=job_id,
+            misfire_grace_time=3600,
+            replace_existing=True,
+        )
+
     # 周期性能力重探: 付费 Key 中途过期/续费无需重启即可被发现。
     # 只热更新 app.state.capabilities(API 端点、盘后管道 _pipeline_then_refresh 均读它);
     # 档位变化记 WARNING, 让「Key 失效」在日志/前端可见, 不再静默按旧档位打 403 端点。
