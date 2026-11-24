@@ -278,7 +278,8 @@ def _map_snapshot_row(row: dict, fetched_ms: int, *, volume_to_hand: bool = True
 
     实测字段(2026-08): high_price / low_price / prev_price;
     官方文档示例: highest_price / lowest_price / prev_close_price。两者都取。
-    volume_to_hand: A 股快照 volume 为股 → 手; 指数快照无此口径, 直接透传。
+    volume_to_hand: 扶摇快照 volume 为股 → 手 (floor /100)。A 股与指数同口径:
+    2026-11-24 实测指数快照也是股, 与历史日K一致转手。
     """
     symbol = row.get("thscode")
     if not symbol:
@@ -469,7 +470,9 @@ class FuyaoProvider:
         fetched_ms = server_ts or int(time.time() * 1000)
         records = []
         for row in rows:
-            rec = _map_snapshot_row(row, fetched_ms, volume_to_hand=False)
+            # 指数快照 volume 同样是股 (2026-11-24 实测), 与历史日K一致转手;
+            # 不转会写出比历史大 100 倍的行, 把指数成交量图压成一根线。
+            rec = _map_snapshot_row(row, fetched_ms, volume_to_hand=True)
             if rec is not None:
                 records.append(rec)
         logger.info("扶摇指数行情拉取完成: %d 条(请求 %d 只)", len(records), len(wanted))

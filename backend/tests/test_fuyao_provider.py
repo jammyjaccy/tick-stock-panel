@@ -294,8 +294,8 @@ def _index_provider_with(monkeypatch, **kwargs):
     return FuyaoProvider(), fake
 
 
-def test_realtime_indices_maps_and_keeps_volume_unit(monkeypatch):
-    """指数快照 → realtime record; volume 无股→手口径, 直接透传。"""
+def test_realtime_indices_maps_and_converts_volume_unit(monkeypatch):
+    """指数快照 → realtime record; volume 与历史日K同口径 股→手 (floor /100)。"""
     provider, fake = _index_provider_with(
         monkeypatch,
         rows=[_row("000001.SH", volume=576656606, price_change_ratio_pct=0.86)],
@@ -308,7 +308,7 @@ def test_realtime_indices_maps_and_keeps_volume_unit(monkeypatch):
     assert r["symbol"] == "000001.SH"
     assert r["change_pct"] == pytest.approx(0.0086)
     assert r["timestamp"] == 1787542612000
-    assert r["volume"] == 576656606  # 不做 /100
+    assert r["volume"] == 5766566  # 股 → 手, floor(576656606 / 100)
 
 
 def test_realtime_indices_skips_bj_symbols(monkeypatch):
