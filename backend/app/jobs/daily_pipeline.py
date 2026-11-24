@@ -22,8 +22,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.indicators.pipeline import filter_halt_days, run_pipeline
-from app.market_time import cn_today
-from app.services import index_sync, instrument_sync, kline_sync
+from app.market_time import cn_now, cn_today
+from app.services import index_sync, instrument_sync, kline_sync, minute_gaps
 from app.services import preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import get_pool
@@ -692,6 +692,27 @@ def run_now(
             on_chunk_done=_minute_chunk_progress,
         )
         minute_dir = repo.store.data_dir / "kline_minute"
+        # 当天缺口修复: 盘中点开分时 (live=1) / 单股补历史会把当日分区只写到
+        # 盘中某时点, 而增量同步从"全局最新分钟"开始拉, 其余标的早盘会被整段跳过
+        # (2026-11-24 实测: 全市场只落了 11:10 之后, 早盘 09:30~11:09 缺失).
+        # 收盘后按修复模式 (missing_only) 重拉全天, 只补缺失行, 不覆盖已有数据。
+        try:
+            now_cn = cn_now()
+            scan = minute_gaps.scan_minute_gaps(
+                minute_dir,
+                today=today,
+                now_hm=(now_cn.hour, now_cn.minute),
+                dates=[today.isoformat()],
+                limit=1,
+            )
+            if scan.get("gaps"):
+                logger.warning("sync_minute: 当天分区存在缺口, 按修复模式重拉全天")
+                written_minute += kline_sync.sync_and_persist_minute(
+                    minute_symbols, repo, capset, days=minute_days,
+                    on_chunk_done=_minute_chunk_progress, repair_date=today,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("sync_minute: 当天缺口修复失败: %s", e)
         minute_cover_days = len(list(minute_dir.glob("date=*"))) if minute_dir.exists() else 0
         emit("sync_minute", 93, f"分钟K完成,覆盖 {minute_cover_days} 天")
         logger.info("sync_minute: [%s ~ %s] done, %d days", minute_start, today, minute_cover_days)
