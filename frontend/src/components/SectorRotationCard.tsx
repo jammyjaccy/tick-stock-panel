@@ -557,6 +557,9 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
       series: heatSeries.sectors.map((name, i) => {
         const color = colorForSector(name)
         const row = heatSeries.matrix[i] ?? []
+        // 实时曲线首个桶只有 1 个点时, line + symbol:none 画不出任何东西;
+        // 单点场景改用圆点, 打开页面就能看到当前值 (第二个桶出现后恢复纯线)
+        const singlePoint = timeline.length === 1
         // 数据对齐全天轴: 窗口内的桶取真实值, 未产生/缺失的桶为 null (右侧留白)
         const linedata = axisBuckets.map(label => {
           const winIdx = dataIndexOf.get(label)
@@ -573,7 +576,8 @@ export function SectorRotationCard({ kind }: { kind: 'concept' | 'industry' }) {
           name,
           type: 'line' as const,
           smooth: true,
-          symbol: 'none',
+          symbol: singlePoint ? 'circle' : 'none',
+          ...(singlePoint ? { symbolSize: 4 } : {}),
           data: linedata,
           lineStyle: { color, width: 1.4 },
           connectNulls: true,

@@ -850,7 +850,19 @@ class QuoteService:
         if snapshot is not None:
             with self._evaluate_lock:
                 self._evaluate_monitors(*snapshot)
+            self._record_sector_live(snapshot)
         return updated
+
+    def _record_sector_live(self, snapshot: tuple[pl.DataFrame, pl.DataFrame | None]) -> None:
+        """把本轮全市场快照交给盘中板块曲线采样 (失败不影响行情主流程)。"""
+        if self._repo is None:
+            return
+        try:
+            from app.services import sector_live
+
+            sector_live.submit_snapshot(self._repo, snapshot[0], snapshot[1])
+        except Exception as exc:  # noqa: BLE001 -- 采样是增强能力, 不得阻断行情轮询
+            logger.debug("sector_live submit failed: %s", exc)
 
     def _fetch_full_market_quotes(
         self, final_boundary_ms: int | None = None

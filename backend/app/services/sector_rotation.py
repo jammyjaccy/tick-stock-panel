@@ -3,6 +3,8 @@
 数据来源 (零新增数据源, 全部复用现有资产):
   - 全市场当日分钟K: data/kline_minute/date=X/part.parquet (全量分钟能力落盘,
     MinuteRefreshService 盘中持续增量写入), 直读单日分区 4 列, 不走仓库层批量接口
+  - 盘中实时快照曲线: data/sector_live/date=X/part-HHMM.parquet (sector_live 服务
+    在实时行情每轮成功后逐分钟聚合), 当日分钟分区缺失时用它替代"回放上一交易日"
   - 板块成分映射: rps_rotation._load_concept_map_df (概念/行业二选一, 600s 缓存)
   - 资金流向: 用户选择的扩展数据列 ("表id.列名", 运行时参数不写死),
     读该扩展表最新分区按板块聚合成分股数值
@@ -35,7 +37,8 @@ from typing import Any
 
 import polars as pl
 
-from app.market_time import trading_minutes_elapsed_from_dt
+from app.market_time import cn_today, trading_minutes_elapsed_from_dt
+from app.services import sector_live
 from app.services.ext_data import ExtConfigStore
 from app.services.rps_rotation import _load_concept_map_df
 
@@ -448,41 +451,61 @@ def build_sector_rotation(
 def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, bucket_minutes: int, series_names: list[str] | None, exclude_sectors: tuple[str, ...], auto_rows: int, sort_by: str) -> dict:
     minute_dir = data_dir / "kline_minute"
     target = _latest_minute_partition(minute_dir)
-    if not target:
+    today = cn_today().isoformat()
+
+    # 当日分钟分区存在时优先用它 (含成交额、从 9:30 起的完整曲线); 否则用实时
+    # 快照曲线补位 —— 没有它就只能回放上一交易日, 盘中毫无意义。
+    live = (
+        None if target == today
+        else sector_live.load_day(data_dir, kind, bucket_minutes=bucket_minutes)
+    )
+    if live is None and not target:
         return {"status": "no_data", "reason": "minute_missing", "kind": kind}
 
     map_df, member_count = _load_concept_map_df(repo, kind)
     if map_df.is_empty() or member_count == 0:
-        return {"status": "no_data", "reason": "members_missing", "date": target, "kind": kind}
+        return {"status": "no_data", "reason": "members_missing", "date": target or (live or {}).get("date"), "kind": kind}
 
-    pcts, basis, has_amount = _minute_pcts(minute_dir, target)
-    if pcts is None:
-        return {"status": "no_data", "reason": basis, "date": target, "kind": kind}
-
-    # 桶化 + 板块聚合: 先每股桶内均值 (成交额按桶合计), 再板块等权均值 (停牌/缺分钟不放大权重)
     member_df = map_df.rename({"_sym_up": "_bare", kind: "_member"})
-    buckets = pcts.with_columns(pl.col("datetime").dt.truncate(f"{bucket_minutes}m").alias("_bucket"))
-    stock_agg = [pl.col("_pct").mean().alias("_sym_pct")]
-    if has_amount:
-        stock_agg.append(pl.col("amount").sum().alias("_sym_amt"))
-    by_sector = (
-        buckets.join(member_df, on="_bare", how="inner")
-        .group_by(["_bucket", "_member", "_bare"])
-        .agg(stock_agg)
-        .group_by(["_bucket", "_member"])
-        .agg(
-            pl.col("_sym_pct").mean().alias("_spct"),
-            pl.len().alias("_n"),
-            *( [pl.col("_sym_amt").sum().alias("_amt")] if has_amount else [] ),
+    pcts = None
+    if live is None:
+        pcts, basis, has_amount = _minute_pcts(minute_dir, target)
+        if pcts is None:
+            # 当日分钟分区不可读 (残缺/写坏) 时再试实时快照; 仍无则按原口径 fail-closed
+            live = sector_live.load_day(data_dir, kind, bucket_minutes=bucket_minutes)
+            if live is None:
+                return {"status": "no_data", "reason": basis, "date": target, "kind": kind}
+
+    if live is not None:
+        target = live["date"]
+        by_sector = live["by_sector"]
+        market = live["market"]
+        # 快照 change_pct 即相对昨收, 与分钟路径 prev_close 同基准
+        basis = "prev_close"
+        has_amount = live["has_amount"]
+    else:
+        # 桶化 + 板块聚合: 先每股桶内均值 (成交额按桶合计), 再板块等权均值 (停牌/缺分钟不放大权重)
+        buckets = pcts.with_columns(pl.col("datetime").dt.truncate(f"{bucket_minutes}m").alias("_bucket"))
+        stock_agg = [pl.col("_pct").mean().alias("_sym_pct")]
+        if has_amount:
+            stock_agg.append(pl.col("amount").sum().alias("_sym_amt"))
+        by_sector = (
+            buckets.join(member_df, on="_bare", how="inner")
+            .group_by(["_bucket", "_member", "_bare"])
+            .agg(stock_agg)
+            .group_by(["_bucket", "_member"])
+            .agg(
+                pl.col("_sym_pct").mean().alias("_spct"),
+                pl.len().alias("_n"),
+                *( [pl.col("_sym_amt").sum().alias("_amt")] if has_amount else [] ),
+            )
+            .sort(["_bucket", "_spct"], descending=[False, True])
         )
-        .sort(["_bucket", "_spct"], descending=[False, True])
-    )
+        market = (
+            buckets.group_by("_bucket").agg(pl.col("_pct").mean().alias("_mpct")).sort("_bucket")
+        )
     if by_sector.is_empty():
         return {"status": "empty", "reason": "no_member_bars", "date": target, "kind": kind}
-
-    market = (
-        buckets.group_by("_bucket").agg(pl.col("_pct").mean().alias("_mpct")).sort("_bucket")
-    )
 
     # 每桶领涨板块 + top 集合 (供切换走势与排名对照) + 0 轴穿越统计 (涨跌切换:
     # 板块涨幅由负转正 = 转强/上穿, 由正转负 = 转弱/下穿; ≥0 计为多方)
