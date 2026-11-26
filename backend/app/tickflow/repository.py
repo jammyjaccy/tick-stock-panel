@@ -691,7 +691,11 @@ class KlineRepository:
                 df_hist = guarded_collect(lf.select(read_cols), priority="background")
                 logger.info("enriched refresh step done: collect history rows=%d (%.2fs)", len(df_hist), time.perf_counter() - step)
                 if not df_hist.is_empty():
-                    instruments = self._instruments_cache if self._instruments_cache is not None else pl.DataFrame()
+                    # 维表决定涨跌停判定价/ST/股本列能否计算。信号增删等失效路径
+                    # 走 clear_cache 会丢维表, 这里必须懒加载补齐; 否则
+                    # compute_enriched_history_window 跳过 compute_limit_signals,
+                    # 缓存会带着缺列一直用到下次全量刷新。
+                    instruments = self.get_instruments()
 
                     # 分批计算并关联元数据, 保留完整历史, 限制宽表临时副本。
                     step = time.perf_counter()
