@@ -43,16 +43,27 @@ from app.tickflow.rate_limits import (
 logger = logging.getLogger(__name__)
 
 
+def _entry_has_volume(entry: dict) -> bool:
+    return (entry.get("bid1_vol") or 0) > 0 or (entry.get("ask1_vol") or 0) > 0
+
+
 def _has_volume(cache: dict) -> bool:
     """快照里是否还有真实挂单量。
 
     收盘后腾讯 qt.gtimg.cn 会把五档成交量清零 (只剩买一价), 这种快照不能
     覆盖盘中数据, 也不能直接定版。
     """
-    return any(
-        (e.get("bid1_vol") or 0) > 0 or (e.get("ask1_vol") or 0) > 0
-        for e in cache.values()
-    )
+    return any(_entry_has_volume(e) for e in cache.values())
+
+
+def _is_continuous_book(bid1: int | None, ask1: int | None) -> bool:
+    """买一量/卖一量是否构成连续竞价盘口。
+
+    连续竞价下涨跌停标的必有一侧封死为 0; 买一量 == 卖一量 (含两侧都为 0
+    或缺量) 是收盘集合竞价 14:57-15:00 的镜像盘口或收盘后量被清零的形态。
+    此时 ask1 != 0 会把真封判成封不死, 不能用于 sealed 判定, 也不能定版。
+    """
+    return bid1 is not None and ask1 is not None and bid1 != ask1
 
 
 # 套餐 → (轮询间隔下限s, 上限s)
@@ -307,11 +318,16 @@ class DepthService:
         now_wall = time.time()
 
         new_cache: dict[str, dict] = {}
+        auction_state: list[str] = []
         for sym, d in depth_data.items():
             ask_vols = d.get("ask_volumes") or []
             bid_vols = d.get("bid_volumes") or []
             ask1 = ask_vols[0] if ask_vols else None
             bid1 = bid_vols[0] if bid_vols else None
+            # 竞价态/无量盘口不参与 sealed 判定: 沿用同一天上一盘的值。
+            if not _is_continuous_book(bid1, ask1):
+                auction_state.append(sym)
+                continue
             # depth 返回的 timestamp(毫秒 epoch), 回退到当前 wall-clock
             depth_ts = d.get("timestamp")
             fetched = (depth_ts / 1000.0) if isinstance(depth_ts, (int, float)) and depth_ts else now_wall
@@ -336,11 +352,12 @@ class DepthService:
             with self._lock:
                 prev_cache = dict(self._sealed_cache)
                 prev_day = self._sealed_date
-            reason = (
-                "五档成交量已清零"
-                if not _has_volume(new_cache)
-                else f"快照残缺({len(new_cache)}/{expected} 只)"
-            )
+            if auction_state and not new_cache:
+                reason = f"竞价态/无量盘口({len(auction_state)} 只)"
+            elif not _has_volume(new_cache):
+                reason = "五档成交量已清零"
+            else:
+                reason = f"快照残缺({len(new_cache)}/{expected} 只)"
             if prev_day == enriched_date and prev_cache and _has_volume(prev_cache):
                 logger.warning(
                     "depth sealed: %s, 保持盘中最后一盘 %d 只 (日期=%s)%s",
@@ -351,6 +368,23 @@ class DepthService:
             else:
                 logger.warning("depth sealed: %s 且无可沿用的盘中缓存, 本轮跳过", reason)
             return
+
+        # 部分标的处于竞价态/无量: 用同一天上一盘的有效值补齐, 避免缺行。
+        if auction_state:
+            with self._lock:
+                prev_cache = dict(self._sealed_cache)
+                prev_day = self._sealed_date
+            kept = 0
+            if prev_day == enriched_date:
+                for sym in auction_state:
+                    prev_entry = prev_cache.get(sym)
+                    if prev_entry and _entry_has_volume(prev_entry):
+                        new_cache[sym] = prev_entry
+                        kept += 1
+            logger.warning(
+                "depth sealed: 忽略竞价态/无量盘口 %d 只 (沿用上一盘 %d 只)",
+                len(auction_state), kept,
+            )
 
         with self._lock:
             self._sealed_cache = new_cache

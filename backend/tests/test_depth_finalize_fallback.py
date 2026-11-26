@@ -253,3 +253,70 @@ def test_close_integrity_check_passes_with_rows(tmp_path, monkeypatch):
     assert result["ok"] is True
     assert result["rows"] == 1
     assert alerted == []
+
+
+# ---- 收盘集合竞价 (14:57-15:00) 镜像盘口: 买一量 == 卖一量不能用于 sealed ----
+
+
+def _auction_snapshot(sym: str = "000001.SZ", vol: int = 50000) -> dict:
+    """竞价态镜像盘口: 买一量 == 卖一量 (>0), ask1 != 0 会把真封判成封不死。"""
+    return {sym: {"ask_volumes": [vol, 0, 0, 0, 0], "bid_volumes": [vol, 0, 0, 0, 0],
+                  "timestamp": 1_700_000_000_000}}
+
+
+def test_auction_mirror_snapshot_keeps_previous_cache() -> None:
+    svc = _svc(_good_cache())
+
+    svc._seal_locked(_auction_snapshot(), ["000001.SZ"], [], DAY, persist=True)
+
+    entry = svc._sealed_cache["000001.SZ"]
+    assert entry["sealed_up"] is True
+    assert entry["bid1_vol"] == 50000
+    assert svc.persisted == [DAY]
+
+
+def test_auction_snapshot_without_previous_cache_is_skipped() -> None:
+    svc = _svc()
+
+    svc._seal_locked(_auction_snapshot(), ["000001.SZ"], [], DAY, persist=True)
+
+    assert svc._sealed_cache == {}
+    assert svc.persisted == []
+
+
+def test_mixed_snapshot_updates_valid_and_keeps_auction_symbol() -> None:
+    prev = {
+        "000001.SZ": {"sealed_up": True, "sealed_down": None, "ask1_vol": 0,
+                      "bid1_vol": 50000, "status": "limit_up", "fetched_ts": 1.0},
+        "000002.SZ": {"sealed_up": True, "sealed_down": None, "ask1_vol": 0,
+                      "bid1_vol": 40000, "status": "limit_up", "fetched_ts": 1.0},
+    }
+    svc = _svc(prev)
+    svc._maybe_persist_intraday = lambda d: None  # type: ignore[method-assign]
+    snapshot = {
+        **_good_snapshot("000001.SZ", bid=777),
+        **_auction_snapshot("000002.SZ", vol=88888),
+    }
+
+    svc._seal_locked(snapshot, ["000001.SZ", "000002.SZ"], [], DAY, persist=False)
+
+    assert svc._sealed_cache["000001.SZ"]["bid1_vol"] == 777
+    assert svc._sealed_cache["000002.SZ"]["bid1_vol"] == 40000
+
+
+def test_zero_volume_pair_in_mixed_snapshot_does_not_overwrite() -> None:
+    # 收盘后量清零只剩价格: 买一量==卖一量==0, 旧逻辑会判 sealed_up=True 且封单 0
+    prev = {"000002.SZ": {"sealed_up": True, "sealed_down": None, "ask1_vol": 0,
+                          "bid1_vol": 40000, "status": "limit_up", "fetched_ts": 1.0}}
+    svc = _svc(prev)
+    svc._maybe_persist_intraday = lambda d: None  # type: ignore[method-assign]
+    snapshot = {
+        **_good_snapshot("000001.SZ", bid=777),
+        "000002.SZ": {"ask_volumes": [0, 0, 0, 0, 0], "bid_volumes": [0, 0, 0, 0, 0],
+                      "timestamp": 1_700_000_000_000},
+    }
+
+    svc._seal_locked(snapshot, ["000001.SZ", "000002.SZ"], [], DAY, persist=False)
+
+    assert svc._sealed_cache["000001.SZ"]["bid1_vol"] == 777
+    assert svc._sealed_cache["000002.SZ"]["bid1_vol"] == 40000
